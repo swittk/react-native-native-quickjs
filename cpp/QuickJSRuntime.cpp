@@ -920,7 +920,16 @@ ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
   }
 
   ExecutionResult result;
-  if (jobs >= maxJobs && JS_IsJobPending(runtime_.rawRuntime())) {
+  if (runtime_.cancellationRequested() || runtime_.deadlineExceeded()) {
+    result.reason =
+        runtime_.cancellationRequested() ? "cancelled" : "deadline";
+    result.code =
+        runtime_.cancellationRequested() ? 1001 : 1002;
+    result.error.name = "InternalError";
+    result.error.message = runtime_.cancellationRequested()
+        ? "Execution cancelled"
+        : "Execution deadline exceeded";
+  } else if (jobs >= maxJobs && JS_IsJobPending(runtime_.rawRuntime())) {
     result.reason = "job-limit";
     result.code = 1005;
     result.error.message = "QuickJS pending-job limit exceeded";

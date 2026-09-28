@@ -2,9 +2,8 @@
 
 #ifdef RCT_NEW_ARCH_ENABLED
 #import <NativeQuickJS/NativeQuickJS.h>
-#import <ReactCommon/RCTTurboModuleWithJSIBindings.h>
 
-@interface SKNativeQuickJS : NSObject <NativeQuickJSSpec, RCTTurboModuleWithJSIBindings>
+@interface SKNativeQuickJS : NSObject <NativeQuickJSSpec>
 #else
 #import <React/RCTBridgeModule.h>
 

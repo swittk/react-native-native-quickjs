@@ -16,7 +16,7 @@ if [[ -z "$react_plugin_dir" ]]; then
     const root = process.argv[1];
     const packageJson = require.resolve("@react-native/gradle-plugin/package.json", {paths: [root]});
     process.stdout.write(path.dirname(packageJson));
-  ' "$repo_dir")"
+  ' "$node_modules_dir")"
 fi
 react_plugin_dir="$(cd "$react_plugin_dir" && pwd -P)"
 
@@ -29,11 +29,21 @@ fi
 react_native_version="${REACT_NATIVE_VERSION:-$(node -e '
   const root = process.argv[1];
   process.stdout.write(require(require.resolve("react-native/package.json", {paths: [root]})).version);
-' "$repo_dir")}"
+' "$node_modules_dir")}"
+
+android_gradle_plugin_version="${ANDROID_GRADLE_PLUGIN_VERSION:-$(
+  sed -n 's/^agp *= *"\([^"]*\)".*/\1/p' \
+    "$node_modules_dir/react-native/gradle/libs.versions.toml" | head -n 1
+)}"
+if [[ -z "$android_gradle_plugin_version" ]]; then
+  echo "Unable to determine Android Gradle Plugin version from selected React Native tree" >&2
+  exit 2
+fi
 
 export REACT_NATIVE_GRADLE_PLUGIN_DIR="$react_plugin_dir"
 export REACT_NATIVE_NODE_MODULES_DIR="$node_modules_dir"
 export REACT_NATIVE_VERSION="$react_native_version"
+export ANDROID_GRADLE_PLUGIN_VERSION="$android_gradle_plugin_version"
 
 "$gradle_command" --no-daemon --console=plain -p "$repo_dir/scripts"   -PnewArchEnabled=true   :react-native-native-quickjs-validation:compileDebugJavaWithJavac   :react-native-native-quickjs-validation:externalNativeBuildDebug
 

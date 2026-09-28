@@ -22,10 +22,6 @@ set(RNQJS_SOURCES
     cpp-adapter.cpp
     ${QUICKJS_SOURCES})
 
-if(RNQJS_NEW_ARCH_ENABLED)
-  list(APPEND RNQJS_SOURCES QuickJSBindingsInstaller.cpp)
-endif()
-
 add_library(SKRNNativeQuickJS SHARED ${RNQJS_SOURCES})
 
 target_compile_definitions(SKRNNativeQuickJS PRIVATE

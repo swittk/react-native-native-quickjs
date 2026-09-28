@@ -1,9 +1,13 @@
 pluginManagement {
   def reactPlugin = System.getenv("REACT_NATIVE_GRADLE_PLUGIN_DIR")
+  def agpVersion = System.getenv("ANDROID_GRADLE_PLUGIN_VERSION") ?: "8.9.1"
   if (reactPlugin == null) {
     throw new GradleException("REACT_NATIVE_GRADLE_PLUGIN_DIR is required")
   }
   includeBuild(file(reactPlugin).canonicalFile)
+  plugins {
+    id "com.android.library" version agpVersion
+  }
   repositories {
     google()
     mavenCentral()

@@ -25,16 +25,41 @@ RCT_EXPORT_MODULE()
 
 #ifdef RCT_NEW_ARCH_ENABLED
 
+namespace {
+class QuickJSTurboModule final : public react::NativeQuickJSSpecJSI {
+ public:
+  explicit QuickJSTurboModule(const react::ObjCTurboModule::InitParams &params)
+      : react::NativeQuickJSSpecJSI(params)
+  {
+    methodMap_["installBindings"] =
+        MethodMetadata{0, &QuickJSTurboModule::installBindings};
+  }
+
+ private:
+  static jsi::Value installBindings(
+      jsi::Runtime &runtime,
+      react::TurboModule &turboModule,
+      const jsi::Value *,
+      size_t)
+  {
+    auto &module = static_cast<QuickJSTurboModule &>(turboModule);
+    SKRNNativeQuickJS::install(runtime, module.jsInvoker_);
+    return jsi::Value::undefined();
+  }
+};
+} // namespace
+
 - (std::shared_ptr<react::TurboModule>)getTurboModule:
     (const react::ObjCTurboModule::InitParams &)params
 {
-  return std::make_shared<react::NativeQuickJSSpecJSI>(params);
+  return std::make_shared<QuickJSTurboModule>(params);
 }
 
-- (void)installJSIBindingsWithRuntime:(jsi::Runtime &)runtime
-                          callInvoker:(const std::shared_ptr<react::CallInvoker> &)callInvoker
+// Satisfies the generated NativeQuickJSSpec Objective-C protocol. New
+// Architecture calls are intercepted by QuickJSTurboModule's method map above
+// so the JSI runtime and CallInvoker are available at the install site.
+- (void)installBindings
 {
-  SKRNNativeQuickJS::install(runtime, callInvoker);
 }
 
 #else

@@ -6,7 +6,7 @@ require Pod::Executable.execute_command('node', ['-p',
   )', __dir__]).strip
 
 # This example intentionally exercises RN 0.73.6's legacy bridge/JSI path.
-ENV['RCT_NEW_ARCH_ENABLED'] = '0'
+ENV['RCT_NEW_ARCH_ENABLED'] ||= '0'
 
 platform :ios, min_ios_version_supported
 prepare_react_native_project!

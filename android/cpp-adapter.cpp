@@ -7,7 +7,7 @@
 #include <fbjni/fbjni.h>
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_reactnativenativequickjs_QuickJSModule_installLegacy(
+Java_com_reactnativenativequickjs_QuickJSBindingInstaller_installNative(
     JNIEnv*,
     jclass,
     jlong runtimePointer,

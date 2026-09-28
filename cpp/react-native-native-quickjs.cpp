@@ -164,7 +164,25 @@ jsi::Value toJSI(
 
   jsi::Object result(runtime);
   for (const auto& [key, item] : std::get<rnquickjs::Value::Object>(value.data)) {
-    result.setProperty(runtime, key.c_str(), toJSI(runtime, item, depth + 1, nodes));
+    auto converted = toJSI(runtime, item, depth + 1, nodes);
+    if (key != "__proto__") {
+      result.setProperty(runtime, key.c_str(), std::move(converted));
+      continue;
+    }
+
+    auto defineProperty = runtime.global()
+        .getPropertyAsObject(runtime, "Object")
+        .getPropertyAsFunction(runtime, "defineProperty");
+    jsi::Object descriptor(runtime);
+    descriptor.setProperty(runtime, "value", std::move(converted));
+    descriptor.setProperty(runtime, "writable", true);
+    descriptor.setProperty(runtime, "enumerable", true);
+    descriptor.setProperty(runtime, "configurable", true);
+    defineProperty.call(
+        runtime,
+        result,
+        jsi::String::createFromUtf8(runtime, key),
+        descriptor);
   }
   return result;
 }

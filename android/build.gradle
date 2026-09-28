@@ -38,6 +38,16 @@ static def findNodeModules(File projectDirectory, File rootDirectory) {
 }
 
 def nodeModules = findNodeModules(projectDir, rootProject.projectDir)
+def reactNativeVersionsFile = file("${nodeModules}/react-native/gradle/libs.versions.toml")
+def reactNativeVersionValue = { String name, Object fallback ->
+  if (reactNativeVersionsFile.exists()) {
+    def matcher = reactNativeVersionsFile.text =~ /(?m)^${name}\s*=\s*"([^"]+)"/
+    if (matcher.find()) {
+      return matcher.group(1)
+    }
+  }
+  return fallback.toString()
+}
 def reactNativePackage = new JsonSlurper().parse(file("${nodeModules}/react-native/package.json"))
 def reactNativeVersionMatch = reactNativePackage.version =~ /^(\d+)\.(\d+)\.(\d+)/
 if (!reactNativeVersionMatch.find()) {
@@ -52,6 +62,17 @@ if (reactNativeMajorVersion == 0 &&
         (reactNativeMinorVersion == 73 && reactNativePatchVersion < 6))) {
   throw new GradleException("react-native-native-quickjs requires React Native 0.73.6 or newer")
 }
+def rnMinSdkVersion = reactNativeVersionValue(
+    "minSdk", reactNativeMinorVersion >= 80 ? 24 : 21).toInteger()
+def rnTargetSdkVersion = reactNativeVersionValue(
+    "targetSdk", reactNativeMinorVersion >= 80 ? 35 : 34).toInteger()
+def rnCompileSdkVersion = reactNativeVersionValue(
+    "compileSdk", reactNativeMinorVersion >= 80 ? 35 : 34).toInteger()
+def rnNdkVersion = reactNativeVersionValue(
+    "ndkVersion", reactNativeMinorVersion >= 80 ? "27.1.12297006" : "25.1.8937393")
+def rnFbjniVersion = reactNativeVersionValue(
+    "fbjni", reactNativeMinorVersion >= 76 ? "0.7.0" : "0.5.1")
+
 def newArchitectureEnabled =
     project.hasProperty("newArchEnabled") && project.property("newArchEnabled") == "true"
 def reactNativeArchitectures = project.findProperty("reactNativeArchitectures")
@@ -73,15 +94,15 @@ android {
   namespace "com.reactnativenativequickjs"
 
   compileSdkVersion safeExtGet(
-      "QuickJS_compileSdkVersion", safeExtGet("compileSdkVersion", reactNativeMinorVersion >= 80 ? 35 : 34))
+      "QuickJS_compileSdkVersion", safeExtGet("compileSdkVersion", rnCompileSdkVersion))
   ndkVersion safeExtGet(
-      "QuickJS_ndkVersion", safeExtGet("ndkVersion", reactNativeMinorVersion >= 80 ? "27.1.12297006" : "25.1.8937393"))
+      "QuickJS_ndkVersion", safeExtGet("ndkVersion", rnNdkVersion))
 
   defaultConfig {
     minSdkVersion safeExtGet(
-        "QuickJS_minSdkVersion", safeExtGet("minSdkVersion", reactNativeMinorVersion >= 80 ? 24 : 21))
+        "QuickJS_minSdkVersion", safeExtGet("minSdkVersion", rnMinSdkVersion))
     targetSdkVersion safeExtGet(
-        "QuickJS_targetSdkVersion", safeExtGet("targetSdkVersion", reactNativeMinorVersion >= 80 ? 35 : 34))
+        "QuickJS_targetSdkVersion", safeExtGet("targetSdkVersion", rnTargetSdkVersion))
     buildConfigField "boolean", "IS_NEW_ARCHITECTURE_ENABLED", newArchitectureEnabled.toString()
 
     externalNativeBuild {
@@ -151,5 +172,5 @@ repositories {
 
 dependencies {
   implementation "com.facebook.react:react-android"
-  implementation "com.facebook.fbjni:fbjni:${safeExtGet('fbjniVersion', reactNativeMinorVersion >= 76 ? '0.7.0' : '0.5.1')}"
+  implementation "com.facebook.fbjni:fbjni:${safeExtGet('fbjniVersion', rnFbjniVersion)}"
 }

@@ -365,10 +365,10 @@ function ensureJSIBindings(): void {
     return;
   }
 
-  // Legacy RN exposes a blocking synchronous install hook. Because this helper
-  // is called from React Native JavaScript, the native JSI mutation happens on
-  // the JS thread instead of the native-modules/main queues.
-  NativeQuickJS.installBindings?.();
+  // Install synchronously from the React Native JS thread. This explicit
+  // TurboModule method is used across architectures so the package does not
+  // depend on version-specific JSI installer protocols.
+  NativeQuickJS.installBindings();
 }
 
 /**

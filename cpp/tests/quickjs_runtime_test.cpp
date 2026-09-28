@@ -725,6 +725,43 @@ int main() {
 
     std::thread worker([&] {
       QuickJSRuntime runtime;
+      auto context = runtime.createContext();
+      active.store(&runtime, std::memory_order_release);
+      {
+        std::lock_guard<std::mutex> lock(readyMutex);
+        ready = true;
+      }
+      readyCondition.notify_one();
+      result = context->evaluateAwaited(
+          "await new Promise(() => {})",
+          "intentional-pending.js",
+          EvalMode::AsyncScript);
+      active.store(nullptr, std::memory_order_release);
+    });
+
+    {
+      std::unique_lock<std::mutex> lock(readyMutex);
+      readyCondition.wait(lock, [&] { return ready; });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    if (auto* runtime = active.load(std::memory_order_acquire)) {
+      runtime->requestCancellation();
+    }
+    worker.join();
+    check(
+        result.reason == "cancelled",
+        "never-settling awaited Promise intentionally remains pending until cancellation");
+  }
+
+  {
+    rnquickjs::ExecutionResult result;
+    std::atomic<QuickJSRuntime*> active{nullptr};
+    std::mutex readyMutex;
+    std::condition_variable readyCondition;
+    bool ready = false;
+
+    std::thread worker([&] {
+      QuickJSRuntime runtime;
       check(
           runtime.executionLimitMs() == 0,
           "default execution deadline is disabled");
@@ -751,6 +788,26 @@ int main() {
     check(
         result.reason == "cancelled",
         "default-unlimited execution remains externally cancellable");
+  }
+
+  {
+    RuntimeOptions options;
+    options.executionLimitMs = 15;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+
+    std::thread watchdog([&runtime] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      runtime.requestCancellation();
+    });
+    auto result = context->evaluateAwaited(
+        "await 0; for (;;) {}",
+        "resumed-deadline.js",
+        EvalMode::AsyncScript);
+    watchdog.join();
+    check(
+        !result.ok() && result.reason == "deadline",
+        "resumed async job preserves configured deadline classification");
   }
 
   {

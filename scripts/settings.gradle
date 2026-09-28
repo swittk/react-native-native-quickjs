@@ -1,0 +1,24 @@
+pluginManagement {
+  def reactPlugin = System.getenv("REACT_NATIVE_GRADLE_PLUGIN_DIR")
+  if (reactPlugin == null) {
+    throw new GradleException("REACT_NATIVE_GRADLE_PLUGIN_DIR is required")
+  }
+  includeBuild(reactPlugin)
+  repositories {
+    google()
+    mavenCentral()
+    gradlePluginPortal()
+  }
+}
+
+rootProject.name = "react-native-native-quickjs-modern-validation"
+include(":react-native-native-quickjs-validation")
+project(":react-native-native-quickjs-validation").projectDir = new File(settingsDir, "../android")
+
+dependencyResolutionManagement {
+  repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
+  repositories {
+    google()
+    mavenCentral()
+  }
+}

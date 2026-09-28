@@ -1,0 +1,18 @@
+{
+  "modules": {
+    "NativeQuickJS": {
+      "type": "NativeModule",
+      "name": "SKNativeQuickJS",
+      "platforms": ["android", "ios"],
+      "jsSrcsDir": "src",
+      "android": {
+        "javaPackageName": "com.reactnativenativequickjs"
+      },
+      "ios": {
+        "modulesProvider": {
+          "SKNativeQuickJS": "SKNativeQuickJS"
+        }
+      }
+    }
+  }
+}

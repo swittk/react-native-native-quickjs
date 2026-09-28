@@ -1,0 +1,1591 @@
+#include "react-native-native-quickjs.h"
+#include "QuickJSRuntime.h"
+
+#include <ReactCommon/CallInvoker.h>
+
+#include <atomic>
+#include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace SKRNNativeQuickJS {
+namespace {
+
+namespace jsi = facebook::jsi;
+using facebook::react::CallInvoker;
+
+constexpr int kMaxBridgeDepth = 32;
+constexpr std::size_t kMaxBridgeNodes = 16'384;
+constexpr double kMaxSafeInteger = 9'007'199'254'740'991.0;
+constexpr const char* kFactoryName = "SKRNNativeQuickJSCreateRuntime";
+constexpr const char* kWorkerFactoryName = "SKRNNativeQuickJSCreateWorker";
+
+void countNode(int depth, std::size_t& nodes) {
+  if (depth > kMaxBridgeDepth || ++nodes > kMaxBridgeNodes) {
+    throw std::runtime_error("Value exceeds QuickJS bridge conversion limits");
+  }
+}
+
+bool isPlainObject(jsi::Runtime& runtime, const jsi::Object& object) {
+  if (object.isHostObject(runtime) || object.isFunction(runtime) ||
+      object.isArrayBuffer(runtime)) {
+    return false;
+  }
+
+  const auto objectConstructor =
+      runtime.global().getPropertyAsObject(runtime, "Object");
+  const auto getPrototypeOf =
+      objectConstructor.getPropertyAsFunction(runtime, "getPrototypeOf");
+  const auto prototype =
+      objectConstructor.getPropertyAsObject(runtime, "prototype");
+  const auto actual = getPrototypeOf.call(runtime, object);
+  return actual.isNull() ||
+      (actual.isObject() && jsi::Object::strictEquals(
+          runtime, actual.asObject(runtime), prototype));
+}
+
+rnquickjs::Value fromJSI(
+    jsi::Runtime& runtime,
+    const jsi::Value& value,
+    int depth,
+    std::size_t& nodes) {
+  countNode(depth, nodes);
+  if (value.isUndefined()) {
+    return rnquickjs::Value{};
+  }
+  if (value.isNull()) {
+    return rnquickjs::Value{nullptr};
+  }
+  if (value.isBool()) {
+    return rnquickjs::Value{value.getBool()};
+  }
+  if (value.isNumber()) {
+    return rnquickjs::Value{value.asNumber()};
+  }
+  if (value.isString()) {
+    return rnquickjs::Value{value.asString(runtime).utf8(runtime)};
+  }
+  if (!value.isObject()) {
+    throw std::runtime_error(
+        "QuickJS bridge values support only undefined, null, booleans, numbers, strings, arrays, and plain objects");
+  }
+
+  auto object = value.asObject(runtime);
+  if (object.isArray(runtime)) {
+    auto array = object.asArray(runtime);
+    const auto size = array.size(runtime);
+    if (size > kMaxBridgeNodes) {
+      throw std::runtime_error("Array exceeds QuickJS bridge conversion limits");
+    }
+    rnquickjs::Value::Array result;
+    result.reserve(size);
+    for (std::size_t index = 0; index < size; ++index) {
+      const auto item = array.getValueAtIndex(runtime, index);
+      result.push_back(fromJSI(runtime, item, depth + 1, nodes));
+    }
+    return rnquickjs::Value{std::move(result)};
+  }
+
+  if (!isPlainObject(runtime, object)) {
+    throw std::runtime_error("Only plain objects can cross the QuickJS bridge");
+  }
+
+  const auto objectConstructor =
+      runtime.global().getPropertyAsObject(runtime, "Object");
+  const auto keysFunction =
+      objectConstructor.getPropertyAsFunction(runtime, "keys");
+  auto keys = keysFunction.call(runtime, object).asObject(runtime).asArray(runtime);
+  const auto size = keys.size(runtime);
+  if (size > kMaxBridgeNodes) {
+    throw std::runtime_error("Object exceeds QuickJS bridge conversion limits");
+  }
+
+  rnquickjs::Value::Object result;
+  for (std::size_t index = 0; index < size; ++index) {
+    const auto keyValue = keys.getValueAtIndex(runtime, index);
+    const auto key = keyValue.asString(runtime).utf8(runtime);
+    const auto item = object.getProperty(runtime, key.c_str());
+    result.emplace(key, fromJSI(runtime, item, depth + 1, nodes));
+  }
+  return rnquickjs::Value{std::move(result)};
+}
+
+rnquickjs::Value fromJSI(jsi::Runtime& runtime, const jsi::Value& value) {
+  std::size_t nodes = 0;
+  return fromJSI(runtime, value, 0, nodes);
+}
+
+jsi::Value toJSI(
+    jsi::Runtime& runtime,
+    const rnquickjs::Value& value,
+    int depth,
+    std::size_t& nodes) {
+  countNode(depth, nodes);
+  if (std::holds_alternative<std::monostate>(value.data)) {
+    return jsi::Value::undefined();
+  }
+  if (std::holds_alternative<std::nullptr_t>(value.data)) {
+    return jsi::Value::null();
+  }
+  if (const auto* boolean = std::get_if<bool>(&value.data)) {
+    return jsi::Value(*boolean);
+  }
+  if (const auto* number = std::get_if<double>(&value.data)) {
+    return jsi::Value(*number);
+  }
+  if (const auto* string = std::get_if<std::string>(&value.data)) {
+    return jsi::String::createFromUtf8(runtime, *string);
+  }
+  if (const auto* values = std::get_if<rnquickjs::Value::Array>(&value.data)) {
+    jsi::Array result(runtime, values->size());
+    for (std::size_t index = 0; index < values->size(); ++index) {
+      result.setValueAtIndex(
+          runtime, index, toJSI(runtime, (*values)[index], depth + 1, nodes));
+    }
+    return result;
+  }
+
+  jsi::Object result(runtime);
+  for (const auto& [key, item] : std::get<rnquickjs::Value::Object>(value.data)) {
+    result.setProperty(runtime, key.c_str(), toJSI(runtime, item, depth + 1, nodes));
+  }
+  return result;
+}
+
+jsi::Value toJSI(jsi::Runtime& runtime, const rnquickjs::Value& value) {
+  std::size_t nodes = 0;
+  return toJSI(runtime, value, 0, nodes);
+}
+
+jsi::Object memoryToJSI(
+    jsi::Runtime& runtime,
+    const rnquickjs::MemoryStats& memory) {
+  jsi::Object result(runtime);
+  result.setProperty(runtime, "mallocBytes", static_cast<double>(memory.mallocBytes));
+  result.setProperty(
+      runtime, "memoryUsedBytes", static_cast<double>(memory.memoryUsedBytes));
+  result.setProperty(runtime, "mallocCount", static_cast<double>(memory.mallocCount));
+  result.setProperty(runtime, "objectCount", static_cast<double>(memory.objectCount));
+  result.setProperty(runtime, "atomCount", static_cast<double>(memory.atomCount));
+  return result;
+}
+
+jsi::Object resultToJSI(
+    jsi::Runtime& runtime,
+    const rnquickjs::ExecutionResult& result) {
+  jsi::Object value(runtime);
+  value.setProperty(
+      runtime, "reason", jsi::String::createFromUtf8(runtime, result.reason));
+  value.setProperty(runtime, "code", result.code);
+  value.setProperty(
+      runtime,
+      "value",
+      result.value.has_value() ? toJSI(runtime, *result.value)
+                               : jsi::Value::undefined());
+
+  jsi::Object error(runtime);
+  error.setProperty(
+      runtime, "name", jsi::String::createFromUtf8(runtime, result.error.name));
+  error.setProperty(
+      runtime,
+      "message",
+      jsi::String::createFromUtf8(runtime, result.error.message));
+  error.setProperty(
+      runtime, "stack", jsi::String::createFromUtf8(runtime, result.error.stack));
+  value.setProperty(runtime, "error", std::move(error));
+  value.setProperty(runtime, "durationMs", result.durationMs);
+  value.setProperty(runtime, "memory", memoryToJSI(runtime, result.memory));
+  value.setProperty(runtime, "outputTruncated", result.outputTruncated);
+  return value;
+}
+
+double optionalNumber(
+    jsi::Runtime& runtime,
+    const jsi::Object& object,
+    const char* name,
+    double fallback) {
+  const auto value = object.getProperty(runtime, name);
+  if (value.isUndefined()) {
+    return fallback;
+  }
+  if (!value.isNumber() || !std::isfinite(value.asNumber())) {
+    throw jsi::JSError(runtime, std::string(name) + " must be a finite number");
+  }
+  return value.asNumber();
+}
+
+std::size_t optionalSize(
+    jsi::Runtime& runtime,
+    const jsi::Object& object,
+    const char* name,
+    std::size_t fallback) {
+  const double value = optionalNumber(runtime, object, name, fallback);
+  if (value < 0 || value > kMaxSafeInteger) {
+    throw jsi::JSError(runtime, std::string(name) + " is outside the supported range");
+  }
+  return static_cast<std::size_t>(value);
+}
+
+rnquickjs::RuntimeOptions runtimeOptions(
+    jsi::Runtime& runtime,
+    const jsi::Value* arguments,
+    std::size_t count) {
+  rnquickjs::RuntimeOptions result;
+  if (count == 0 || arguments[0].isUndefined()) {
+    return result;
+  }
+  if (!arguments[0].isObject()) {
+    throw jsi::JSError(runtime, "Runtime options must be an object");
+  }
+  const auto options = arguments[0].asObject(runtime);
+  if (!isPlainObject(runtime, options)) {
+    throw jsi::JSError(runtime, "Runtime options must be a plain object");
+  }
+  result.executionLimitMs = static_cast<std::int64_t>(optionalNumber(
+      runtime, options, "executionLimitMs", result.executionLimitMs));
+  result.memoryLimitBytes = optionalSize(
+      runtime, options, "memoryLimitBytes", result.memoryLimitBytes);
+  result.maxStackBytes =
+      optionalSize(runtime, options, "maxStackBytes", result.maxStackBytes);
+  result.maxOutputBytes =
+      optionalSize(runtime, options, "maxOutputBytes", result.maxOutputBytes);
+  result.maxOutputLines =
+      optionalSize(runtime, options, "maxOutputLines", result.maxOutputLines);
+  return result;
+}
+
+std::string requiredString(
+    jsi::Runtime& runtime,
+    const jsi::Value* arguments,
+    std::size_t count,
+    std::size_t index,
+    const char* label) {
+  if (index >= count || !arguments[index].isString()) {
+    throw jsi::JSError(runtime, std::string(label) + " must be a string");
+  }
+  return arguments[index].asString(runtime).utf8(runtime);
+}
+
+std::uint64_t requiredHandle(
+    jsi::Runtime& runtime,
+    const jsi::Value* arguments,
+    std::size_t count,
+    std::size_t index) {
+  if (index >= count || !arguments[index].isNumber()) {
+    throw jsi::JSError(runtime, "QuickJS handle must be a number");
+  }
+  const auto handle = arguments[index].asNumber();
+  if (!std::isfinite(handle) || handle < 1 || handle > kMaxSafeInteger ||
+      std::floor(handle) != handle) {
+    throw jsi::JSError(runtime, "QuickJS handle must be a positive safe integer");
+  }
+  return static_cast<std::uint64_t>(handle);
+}
+
+rnquickjs::EvalMode evalMode(
+    jsi::Runtime& runtime,
+    const jsi::Object& options) {
+  const auto value = options.getProperty(runtime, "mode");
+  if (value.isUndefined()) {
+    return rnquickjs::EvalMode::Script;
+  }
+  if (!value.isString()) {
+    throw jsi::JSError(runtime, "evaluate mode must be a string");
+  }
+  const auto mode = value.asString(runtime).utf8(runtime);
+  if (mode == "script") {
+    return rnquickjs::EvalMode::Script;
+  }
+  if (mode == "module") {
+    return rnquickjs::EvalMode::Module;
+  }
+  if (mode == "async-script") {
+    return rnquickjs::EvalMode::AsyncScript;
+  }
+  if (mode == "async-module") {
+    return rnquickjs::EvalMode::AsyncModule;
+  }
+  throw jsi::JSError(runtime, "Unknown QuickJS evaluate mode: " + mode);
+}
+
+jsi::Function makeFunction(
+    jsi::Runtime& runtime,
+    const char* name,
+    unsigned int argumentCount,
+    jsi::HostFunctionType function) {
+  return jsi::Function::createFromHostFunction(
+      runtime,
+      jsi::PropNameID::forAscii(runtime, name),
+      argumentCount,
+      std::move(function));
+}
+
+rnquickjs::Value invokeJSCallback(
+    jsi::Runtime& runtime,
+    const jsi::Function& callback,
+    const std::vector<rnquickjs::Value>& arguments) {
+  std::vector<jsi::Value> values;
+  values.reserve(arguments.size());
+  for (const auto& argument : arguments) {
+    values.push_back(toJSI(runtime, argument));
+  }
+  const jsi::Value* data = values.data();
+  const auto result = callback.call(runtime, data, values.size());
+  return fromJSI(runtime, result);
+}
+
+rnquickjs::Value invokeOnJSThread(
+    jsi::Runtime& runtime,
+    const std::shared_ptr<CallInvoker>& callInvoker,
+    const std::thread::id& jsThread,
+    const std::shared_ptr<jsi::Function>& callback,
+    const std::vector<rnquickjs::Value>& arguments) {
+  if (std::this_thread::get_id() == jsThread) {
+    return invokeJSCallback(runtime, *callback, arguments);
+  }
+  if (!callInvoker) {
+    throw std::runtime_error("React Native CallInvoker is unavailable");
+  }
+
+  struct Invocation {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool complete = false;
+    std::optional<rnquickjs::Value> result;
+    std::exception_ptr error;
+  };
+  auto invocation = std::make_shared<Invocation>();
+  callInvoker->invokeAsync([
+      &runtime, callback, arguments, invocation]() {
+    try {
+      invocation->result = invokeJSCallback(runtime, *callback, arguments);
+    } catch (...) {
+      invocation->error = std::current_exception();
+    }
+    {
+      std::lock_guard<std::mutex> lock(invocation->mutex);
+      invocation->complete = true;
+    }
+    invocation->ready.notify_one();
+  });
+
+  std::unique_lock<std::mutex> lock(invocation->mutex);
+  invocation->ready.wait(lock, [&invocation] { return invocation->complete; });
+  if (invocation->error) {
+    std::rethrow_exception(invocation->error);
+  }
+  return std::move(*invocation->result);
+}
+
+rnquickjs::ErrorInfo errorFromJSI(
+    jsi::Runtime& runtime,
+    const jsi::Value& value) {
+  rnquickjs::ErrorInfo result;
+  result.name = "Error";
+
+  if (value.isString()) {
+    result.message = value.asString(runtime).utf8(runtime);
+    return result;
+  }
+
+  if (value.isObject()) {
+    auto object = value.asObject(runtime);
+    const auto name = object.getProperty(runtime, "name");
+    const auto message = object.getProperty(runtime, "message");
+    const auto stack = object.getProperty(runtime, "stack");
+    if (name.isString()) {
+      result.name = name.asString(runtime).utf8(runtime);
+    }
+    if (message.isString()) {
+      result.message = message.asString(runtime).utf8(runtime);
+    }
+    if (stack.isString()) {
+      result.stack = stack.asString(runtime).utf8(runtime);
+    }
+  }
+
+  if (result.message.empty()) {
+    try {
+      const auto stringFunction =
+          runtime.global().getPropertyAsFunction(runtime, "String");
+      result.message =
+          stringFunction.call(runtime, value).asString(runtime).utf8(runtime);
+    } catch (...) {
+      result.message = "Host Promise rejected";
+    }
+  }
+  return result;
+}
+
+void invokeAsyncOnJSThread(
+    jsi::Runtime& runtime,
+    const std::shared_ptr<CallInvoker>& callInvoker,
+    const std::shared_ptr<jsi::Function>& callback,
+    const std::vector<rnquickjs::Value>& arguments,
+    rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
+  if (!callInvoker) {
+    rnquickjs::QuickJSContext::AsyncHostResult result;
+    result.ok = false;
+    result.error.name = "HostError";
+    result.error.message = "React Native CallInvoker is unavailable";
+    completion(std::move(result));
+    return;
+  }
+
+  callInvoker->invokeAsync([
+      &runtime,
+      callback,
+      arguments,
+      completion = std::move(completion)]() mutable {
+    auto settle = std::make_shared<std::atomic<bool>>(false);
+    const auto completeOnce =
+        [settle, completion](rnquickjs::QuickJSContext::AsyncHostResult result) {
+          bool expected = false;
+          if (settle->compare_exchange_strong(expected, true)) {
+            completion(std::move(result));
+          }
+        };
+
+    try {
+      std::vector<jsi::Value> values;
+      values.reserve(arguments.size());
+      for (const auto& argument : arguments) {
+        values.push_back(toJSI(runtime, argument));
+      }
+      const jsi::Value* data = values.data();
+      jsi::Value result =
+          callback->call(runtime, data, values.size());
+
+      if (result.isObject()) {
+        auto object = result.asObject(runtime);
+        const auto thenValue = object.getProperty(runtime, "then");
+        if (thenValue.isObject() &&
+            thenValue.asObject(runtime).isFunction(runtime)) {
+          auto resolve = makeFunction(
+              runtime,
+              "resolveQuickJSHostPromise",
+              1,
+              [completeOnce](
+                  jsi::Runtime& rt,
+                  const jsi::Value&,
+                  const jsi::Value* args,
+                  std::size_t count) mutable -> jsi::Value {
+                rnquickjs::QuickJSContext::AsyncHostResult settled;
+                try {
+                  settled.value =
+                      count == 0 ? rnquickjs::Value{} : fromJSI(rt, args[0]);
+                } catch (const std::exception& error) {
+                  settled.ok = false;
+                  settled.error.name = "HostValueError";
+                  settled.error.message = error.what();
+                }
+                completeOnce(std::move(settled));
+                return jsi::Value::undefined();
+              });
+          auto reject = makeFunction(
+              runtime,
+              "rejectQuickJSHostPromise",
+              1,
+              [completeOnce](
+                  jsi::Runtime& rt,
+                  const jsi::Value&,
+                  const jsi::Value* args,
+                  std::size_t count) mutable -> jsi::Value {
+                rnquickjs::QuickJSContext::AsyncHostResult settled;
+                settled.ok = false;
+                settled.error = count == 0
+                    ? rnquickjs::ErrorInfo{"Error", "Host Promise rejected", ""}
+                    : errorFromJSI(rt, args[0]);
+                completeOnce(std::move(settled));
+                return jsi::Value::undefined();
+              });
+
+          auto thenFunction = thenValue.asObject(runtime).asFunction(runtime);
+          thenFunction.callWithThis(
+              runtime,
+              object,
+              {std::move(resolve), std::move(reject)});
+          return;
+        }
+      }
+
+      rnquickjs::QuickJSContext::AsyncHostResult settled;
+      settled.value = fromJSI(runtime, result);
+      completeOnce(std::move(settled));
+    } catch (const std::exception& error) {
+      rnquickjs::QuickJSContext::AsyncHostResult settled;
+      settled.ok = false;
+      settled.error.name = "HostError";
+      settled.error.message = error.what();
+      completeOnce(std::move(settled));
+    } catch (...) {
+      rnquickjs::QuickJSContext::AsyncHostResult settled;
+      settled.ok = false;
+      settled.error.name = "HostError";
+      settled.error.message = "Unknown host async callback failure";
+      completeOnce(std::move(settled));
+    }
+  });
+}
+
+
+struct WorkerTaskResult {
+  std::uint64_t taskId = 0;
+  rnquickjs::ExecutionResult result;
+  std::string output;
+};
+
+class WorkerHostObject final : public jsi::HostObject,
+                               public std::enable_shared_from_this<WorkerHostObject> {
+ public:
+  using Command =
+      std::function<void(rnquickjs::QuickJSRuntime&, rnquickjs::QuickJSContext&)>;
+
+  WorkerHostObject(
+      jsi::Runtime& hostRuntime,
+      std::shared_ptr<CallInvoker> callInvoker,
+      rnquickjs::RuntimeOptions options)
+      : hostRuntime_(hostRuntime),
+        callInvoker_(std::move(callInvoker)),
+        options_(options) {
+    worker_ = std::thread([this] { workerMain(); });
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(lock, [this] { return ready_; });
+    if (!startupError_.empty()) {
+      lock.unlock();
+      if (worker_.joinable()) {
+        worker_.join();
+      }
+      throw std::runtime_error(startupError_);
+    }
+  }
+
+  ~WorkerHostObject() override {
+    shutdown();
+  }
+
+  jsi::Value get(
+      jsi::Runtime& runtime,
+      const jsi::PropNameID& name) override {
+    const auto property = name.utf8(runtime);
+    const std::weak_ptr<WorkerHostObject> weakSelf = shared_from_this();
+
+    if (property == "valid") {
+      return jsi::Value(!disposed_.load(std::memory_order_relaxed));
+    }
+    if (property == "executing") {
+      return jsi::Value(executing_.load(std::memory_order_relaxed));
+    }
+
+    if (property == "startEvaluate") {
+      return makeFunction(runtime, "startEvaluate", 2, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value* args,
+          std::size_t count) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto source =
+            requiredString(rt, args, count, 0, "Source");
+
+        std::string filename = "<worker>";
+        auto mode = rnquickjs::EvalMode::AsyncScript;
+        if (count > 1 && !args[1].isUndefined()) {
+          if (!args[1].isObject()) {
+            throw jsi::JSError(rt, "Evaluate options must be an object");
+          }
+          const auto options = args[1].asObject(rt);
+          if (!isPlainObject(rt, options)) {
+            throw jsi::JSError(rt, "Evaluate options must be a plain object");
+          }
+          const auto filenameValue = options.getProperty(rt, "filename");
+          if (!filenameValue.isUndefined()) {
+            if (!filenameValue.isString()) {
+              throw jsi::JSError(rt, "Evaluate filename must be a string");
+            }
+            filename = filenameValue.asString(rt).utf8(rt);
+          }
+          const auto modeValue = options.getProperty(rt, "mode");
+          if (!modeValue.isUndefined()) {
+            mode = evalMode(rt, options);
+          }
+        }
+
+        const auto taskId = self->startTask([
+            source,
+            filename,
+            mode](
+                rnquickjs::QuickJSRuntime&,
+                rnquickjs::QuickJSContext& context) {
+          return context.evaluateAwaited(source, filename, mode);
+        });
+        return jsi::Value(static_cast<double>(taskId));
+      });
+    }
+
+    if (property == "startRetain") {
+      return makeFunction(runtime, "startRetain", 2, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value* args,
+          std::size_t count) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto source =
+            requiredString(rt, args, count, 0, "Retained source or global");
+        bool global = false;
+        std::string filename = "<retain>";
+        if (count > 1 && !args[1].isUndefined()) {
+          if (!args[1].isObject()) {
+            throw jsi::JSError(rt, "Retain options must be an object");
+          }
+          const auto options = args[1].asObject(rt);
+          if (!isPlainObject(rt, options)) {
+            throw jsi::JSError(rt, "Retain options must be a plain object");
+          }
+          const auto globalValue = options.getProperty(rt, "global");
+          if (!globalValue.isUndefined()) {
+            if (!globalValue.isBool()) {
+              throw jsi::JSError(rt, "Retain global must be a boolean");
+            }
+            global = globalValue.getBool();
+          }
+          const auto filenameValue = options.getProperty(rt, "filename");
+          if (!filenameValue.isUndefined()) {
+            if (!filenameValue.isString()) {
+              throw jsi::JSError(rt, "Retain filename must be a string");
+            }
+            filename = filenameValue.asString(rt).utf8(rt);
+          }
+        }
+
+        const auto taskId = self->startTask([
+            source,
+            filename,
+            global](
+                rnquickjs::QuickJSRuntime& quickjs,
+                rnquickjs::QuickJSContext& context) {
+          const auto started = std::chrono::steady_clock::now();
+          rnquickjs::ExecutionResult result;
+          try {
+            const auto handle = global
+                ? context.retainGlobal(source)
+                : context.retainEvaluation(source, filename);
+            result.value = rnquickjs::Value{static_cast<double>(handle)};
+          } catch (const std::exception& error) {
+            result.reason = "runtime";
+            result.code = 1;
+            result.error.name = "Error";
+            result.error.message = error.what();
+          }
+          result.durationMs = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count();
+          result.memory = quickjs.memoryStats();
+          result.outputTruncated = context.outputWasTruncated();
+          return result;
+        });
+        return jsi::Value(static_cast<double>(taskId));
+      });
+    }
+
+    if (property == "startCall") {
+      return makeFunction(runtime, "startCall", 2, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value* args,
+          std::size_t count) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto handle = requiredHandle(rt, args, count, 0);
+        std::vector<rnquickjs::Value> values;
+        if (count > 1 && !args[1].isUndefined()) {
+          if (!args[1].isObject() ||
+              !args[1].asObject(rt).isArray(rt)) {
+            throw jsi::JSError(rt, "QuickJS call arguments must be an array");
+          }
+          const auto array = args[1].asObject(rt).asArray(rt);
+          const auto size = array.size(rt);
+          values.reserve(size);
+          std::size_t nodes = 0;
+          for (std::size_t index = 0; index < size; ++index) {
+            values.push_back(fromJSI(
+                rt,
+                array.getValueAtIndex(rt, index),
+                0,
+                nodes));
+          }
+        }
+
+        const auto taskId = self->startTask([
+            handle,
+            values = std::move(values)](
+                rnquickjs::QuickJSRuntime&,
+                rnquickjs::QuickJSContext& context) mutable {
+          return context.callAwaited(handle, values);
+        });
+        return jsi::Value(static_cast<double>(taskId));
+      });
+    }
+
+    if (property == "takeTaskResult") {
+      return makeFunction(runtime, "takeTaskResult", 1, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value* args,
+          std::size_t count) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto taskId = requiredHandle(rt, args, count, 0);
+        auto result = self->takeResult(taskId);
+        if (!result.has_value()) {
+          return jsi::Value::null();
+        }
+        auto object = resultToJSI(rt, result->result);
+        object.setProperty(
+            rt,
+            "output",
+            jsi::String::createFromUtf8(rt, result->output));
+        return object;
+      });
+    }
+
+    if (property == "release") {
+      return makeFunction(runtime, "release", 1, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value* args,
+          std::size_t count) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto handle = requiredHandle(rt, args, count, 0);
+        self->enqueue([handle](
+            rnquickjs::QuickJSRuntime&,
+            rnquickjs::QuickJSContext& context) {
+          context.release(handle);
+        });
+        return jsi::Value::undefined();
+      });
+    }
+
+    if (property == "registerAsyncHostFunction") {
+      return makeFunction(runtime, "registerAsyncHostFunction", 2, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value* args,
+          std::size_t count) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto functionName =
+            requiredString(rt, args, count, 0, "Host function name");
+        if (count < 2 || !args[1].isObject() ||
+            !args[1].asObject(rt).isFunction(rt)) {
+          throw jsi::JSError(
+              rt, "Async host callback must be a function");
+        }
+
+        auto callback = std::make_shared<jsi::Function>(
+            args[1].asObject(rt).asFunction(rt));
+        self->callbacks_.push_back(callback);
+        auto* hostRuntime = &self->hostRuntime_;
+        const auto invoker = self->callInvoker_;
+        self->enqueue([
+            functionName,
+            hostRuntime,
+            invoker,
+            callback](
+                rnquickjs::QuickJSRuntime&,
+                rnquickjs::QuickJSContext& context) {
+          context.registerAsyncHostFunction(
+              functionName,
+              [hostRuntime, invoker, callback](
+                  const std::vector<rnquickjs::Value>& values,
+                  rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
+                invokeAsyncOnJSThread(
+                    *hostRuntime,
+                    invoker,
+                    callback,
+                    values,
+                    std::move(completion));
+              });
+        });
+        return jsi::Value::undefined();
+      });
+    }
+
+    if (property == "addModule") {
+      return makeFunction(runtime, "addModule", 2, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value* args,
+          std::size_t count) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto moduleName =
+            requiredString(rt, args, count, 0, "Module name");
+        const auto source =
+            requiredString(rt, args, count, 1, "Module source");
+        if (moduleName.empty()) {
+          throw jsi::JSError(rt, "Module name cannot be empty");
+        }
+        self->enqueue([
+            moduleName,
+            source](
+                rnquickjs::QuickJSRuntime& quickjs,
+                rnquickjs::QuickJSContext&) {
+          quickjs.addModule(moduleName, source);
+        });
+        return jsi::Value::undefined();
+      });
+    }
+
+    if (property == "removeModule") {
+      return makeFunction(runtime, "removeModule", 1, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value* args,
+          std::size_t count) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto moduleName =
+            requiredString(rt, args, count, 0, "Module name");
+        self->enqueue([moduleName](
+            rnquickjs::QuickJSRuntime& quickjs,
+            rnquickjs::QuickJSContext&) {
+          quickjs.removeModule(moduleName);
+        });
+        return jsi::Value::undefined();
+      });
+    }
+
+    if (property == "clearModules") {
+      return makeFunction(runtime, "clearModules", 0, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value*,
+          std::size_t) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        self->enqueue([](
+            rnquickjs::QuickJSRuntime& quickjs,
+            rnquickjs::QuickJSContext&) {
+          quickjs.clearModules();
+        });
+        return jsi::Value::undefined();
+      });
+    }
+
+    if (property == "cancel") {
+      return makeFunction(runtime, "cancel", 0, [weakSelf](
+          jsi::Runtime&,
+          const jsi::Value&,
+          const jsi::Value*,
+          std::size_t) -> jsi::Value {
+        if (const auto self = weakSelf.lock()) {
+          if (auto* quickjs =
+                  self->activeRuntime_.load(std::memory_order_acquire)) {
+            quickjs->requestCancellation();
+          }
+        }
+        return jsi::Value::undefined();
+      });
+    }
+
+    if (property == "dispose") {
+      return makeFunction(runtime, "dispose", 0, [weakSelf](
+          jsi::Runtime&,
+          const jsi::Value&,
+          const jsi::Value*,
+          std::size_t) -> jsi::Value {
+        if (const auto self = weakSelf.lock()) {
+          self->shutdown();
+        }
+        return jsi::Value::undefined();
+      });
+    }
+
+    return jsi::Value::undefined();
+  }
+
+  std::vector<jsi::PropNameID> getPropertyNames(
+      jsi::Runtime& runtime) override {
+    static constexpr const char* names[] = {
+        "valid",
+        "executing",
+        "startEvaluate",
+        "startRetain",
+        "startCall",
+        "takeTaskResult",
+        "release",
+        "registerAsyncHostFunction",
+        "addModule",
+        "removeModule",
+        "clearModules",
+        "cancel",
+        "dispose"};
+    std::vector<jsi::PropNameID> result;
+    result.reserve(sizeof(names) / sizeof(names[0]));
+    for (const char* item : names) {
+      result.push_back(jsi::PropNameID::forAscii(runtime, item));
+    }
+    return result;
+  }
+
+ private:
+  std::uint64_t startTask(
+      std::function<rnquickjs::ExecutionResult(
+          rnquickjs::QuickJSRuntime&,
+          rnquickjs::QuickJSContext&)> operation) {
+    const std::uint64_t taskId = nextTaskId_++;
+    enqueue([
+        this,
+        taskId,
+        operation = std::move(operation)](
+            rnquickjs::QuickJSRuntime& quickjs,
+            rnquickjs::QuickJSContext& context) mutable {
+      executing_.store(true, std::memory_order_release);
+      quickjs.resetCancellation();
+
+      rnquickjs::ExecutionResult result;
+      try {
+        result = operation(quickjs, context);
+      } catch (const std::exception& error) {
+        result.reason = "runtime";
+        result.code = 1;
+        result.error.name = "Error";
+        result.error.message = error.what();
+        result.memory = quickjs.memoryStats();
+        result.outputTruncated = context.outputWasTruncated();
+      } catch (...) {
+        result.reason = "runtime";
+        result.code = 1;
+        result.error.name = "Error";
+        result.error.message = "Unknown QuickJS worker failure";
+        result.memory = quickjs.memoryStats();
+        result.outputTruncated = context.outputWasTruncated();
+      }
+
+      auto output = context.takeOutput();
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        results_.push_back(
+            WorkerTaskResult{taskId, std::move(result), std::move(output)});
+        while (results_.size() > 64) {
+          results_.pop_front();
+        }
+      }
+      executing_.store(false, std::memory_order_release);
+      condition_.notify_all();
+    });
+    return taskId;
+  }
+
+  void enqueue(Command command) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopping_ || disposed_.load(std::memory_order_relaxed)) {
+        throw std::runtime_error("QuickJS worker is disposed");
+      }
+      commands_.push_back(std::move(command));
+    }
+    condition_.notify_one();
+  }
+
+  std::optional<WorkerTaskResult> takeResult(std::uint64_t taskId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = std::find_if(
+        results_.begin(),
+        results_.end(),
+        [taskId](const WorkerTaskResult& result) {
+          return result.taskId == taskId;
+        });
+    if (found == results_.end()) {
+      return std::nullopt;
+    }
+    WorkerTaskResult result = std::move(*found);
+    results_.erase(found);
+    return result;
+  }
+
+  void workerMain() noexcept {
+    try {
+      rnquickjs::QuickJSRuntime quickjs(options_);
+      auto context = quickjs.createContext();
+      activeRuntime_.store(&quickjs, std::memory_order_release);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ready_ = true;
+      }
+      condition_.notify_all();
+
+      while (true) {
+        Command command;
+        {
+          std::unique_lock<std::mutex> lock(mutex_);
+          condition_.wait(lock, [this] {
+            return stopping_ || !commands_.empty();
+          });
+          if (stopping_ && commands_.empty()) {
+            break;
+          }
+          command = std::move(commands_.front());
+          commands_.pop_front();
+        }
+
+        try {
+          command(quickjs, *context);
+        } catch (...) {
+          // Task commands translate their own exceptions. Configuration
+          // commands are validated on the host side; do not kill the VM if a
+          // late native error slips through.
+        }
+      }
+
+      activeRuntime_.store(nullptr, std::memory_order_release);
+      context->dispose();
+      quickjs.dispose();
+    } catch (const std::exception& error) {
+      activeRuntime_.store(nullptr, std::memory_order_release);
+      std::lock_guard<std::mutex> lock(mutex_);
+      startupError_ = error.what();
+      ready_ = true;
+      stopping_ = true;
+      condition_.notify_all();
+    } catch (...) {
+      activeRuntime_.store(nullptr, std::memory_order_release);
+      std::lock_guard<std::mutex> lock(mutex_);
+      startupError_ = "Unknown QuickJS worker startup failure";
+      ready_ = true;
+      stopping_ = true;
+      condition_.notify_all();
+    }
+  }
+
+  void shutdown() noexcept {
+    if (disposed_.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+
+    if (auto* quickjs =
+            activeRuntime_.load(std::memory_order_acquire)) {
+      quickjs->requestCancellation();
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+      commands_.clear();
+    }
+    condition_.notify_all();
+    if (worker_.joinable() &&
+        worker_.get_id() != std::this_thread::get_id()) {
+      worker_.join();
+    }
+    callbacks_.clear();
+  }
+
+  jsi::Runtime& hostRuntime_;
+  std::shared_ptr<CallInvoker> callInvoker_;
+  rnquickjs::RuntimeOptions options_;
+  std::thread worker_;
+  std::thread::id jsThread_{std::this_thread::get_id()};
+
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<Command> commands_;
+  std::deque<WorkerTaskResult> results_;
+  std::vector<std::shared_ptr<jsi::Function>> callbacks_;
+
+  std::atomic<rnquickjs::QuickJSRuntime*> activeRuntime_{nullptr};
+  std::atomic<bool> executing_{false};
+  std::atomic<bool> disposed_{false};
+  bool ready_ = false;
+  bool stopping_ = false;
+  std::string startupError_;
+  std::uint64_t nextTaskId_ = 1;
+};
+
+class RuntimeHostObject;
+
+class ContextHostObject final : public jsi::HostObject,
+                                public std::enable_shared_from_this<ContextHostObject> {
+ public:
+  ContextHostObject(
+      jsi::Runtime& hostRuntime,
+      std::shared_ptr<CallInvoker> callInvoker,
+      std::shared_ptr<RuntimeHostObject> owner,
+      std::unique_ptr<rnquickjs::QuickJSContext> context)
+      : hostRuntime_(hostRuntime),
+        callInvoker_(std::move(callInvoker)),
+        owner_(std::move(owner)),
+        context_(std::move(context)),
+        jsThread_(std::this_thread::get_id()) {}
+
+  ~ContextHostObject() override {
+    if (context_) {
+      context_->dispose();
+    }
+  }
+
+  jsi::Value get(jsi::Runtime& runtime, const jsi::PropNameID& name) override;
+
+  std::vector<jsi::PropNameID> getPropertyNames(jsi::Runtime& runtime) override {
+    static constexpr const char* names[] = {
+        "valid", "outputCount", "outputTruncated", "evaluate", "retain",
+        "call", "release", "executePendingJobs", "getOutput", "takeOutput",
+        "registerHostFunction", "dispose"};
+    std::vector<jsi::PropNameID> result;
+    result.reserve(sizeof(names) / sizeof(names[0]));
+    for (const char* item : names) {
+      result.push_back(jsi::PropNameID::forAscii(runtime, item));
+    }
+    return result;
+  }
+
+ private:
+  rnquickjs::QuickJSContext& requireContext(jsi::Runtime& runtime) const {
+    if (!context_ || !context_->isOpen()) {
+      throw jsi::JSError(runtime, "QuickJS context is disposed");
+    }
+    return *context_;
+  }
+
+  jsi::Runtime& hostRuntime_;
+  std::shared_ptr<CallInvoker> callInvoker_;
+  std::shared_ptr<RuntimeHostObject> owner_;
+  std::unique_ptr<rnquickjs::QuickJSContext> context_;
+  std::thread::id jsThread_;
+};
+
+class RuntimeHostObject final : public jsi::HostObject,
+                                public std::enable_shared_from_this<RuntimeHostObject> {
+ public:
+  RuntimeHostObject(
+      std::shared_ptr<CallInvoker> callInvoker,
+      rnquickjs::RuntimeOptions options)
+      : callInvoker_(std::move(callInvoker)),
+        runtime_(std::make_unique<rnquickjs::QuickJSRuntime>(options)) {}
+
+  ~RuntimeHostObject() override {
+    if (runtime_) {
+      runtime_->dispose();
+    }
+  }
+
+  jsi::Value get(jsi::Runtime& runtime, const jsi::PropNameID& name) override;
+
+  std::vector<jsi::PropNameID> getPropertyNames(jsi::Runtime& runtime) override {
+    static constexpr const char* names[] = {
+        "valid", "executionLimitMs", "memoryLimitBytes", "maxStackBytes",
+        "memory", "createContext", "addModule", "removeModule", "clearModules",
+        "cancel", "resetCancellation", "setExecutionLimitMs",
+        "setMemoryLimitBytes", "setMaxStackBytes", "dispose"};
+    std::vector<jsi::PropNameID> result;
+    result.reserve(sizeof(names) / sizeof(names[0]));
+    for (const char* item : names) {
+      result.push_back(jsi::PropNameID::forAscii(runtime, item));
+    }
+    return result;
+  }
+
+ private:
+  rnquickjs::QuickJSRuntime& requireRuntime(jsi::Runtime& runtime) const {
+    if (!runtime_ || !runtime_->isOpen()) {
+      throw jsi::JSError(runtime, "QuickJS runtime is disposed");
+    }
+    return *runtime_;
+  }
+
+  std::shared_ptr<CallInvoker> callInvoker_;
+  std::unique_ptr<rnquickjs::QuickJSRuntime> runtime_;
+};
+
+jsi::Value RuntimeHostObject::get(
+    jsi::Runtime& runtime,
+    const jsi::PropNameID& name) {
+  const auto property = name.utf8(runtime);
+  if (property == "valid") {
+    return jsi::Value(runtime_ && runtime_->isOpen());
+  }
+  if (property == "executionLimitMs") {
+    return jsi::Value(static_cast<double>(
+        runtime_ ? runtime_->executionLimitMs() : 0));
+  }
+  if (property == "memoryLimitBytes") {
+    return jsi::Value(static_cast<double>(
+        runtime_ ? runtime_->memoryLimitBytes() : 0));
+  }
+  if (property == "maxStackBytes") {
+    return jsi::Value(static_cast<double>(
+        runtime_ ? runtime_->maxStackBytes() : 0));
+  }
+  if (property == "memory") {
+    return memoryToJSI(
+        runtime, runtime_ ? runtime_->memoryStats() : rnquickjs::MemoryStats{});
+  }
+
+  const std::weak_ptr<RuntimeHostObject> weakSelf = shared_from_this();
+  if (property == "createContext") {
+    return makeFunction(runtime, "createContext", 0, [weakSelf](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value*, std::size_t) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS runtime is unavailable");
+      }
+      auto context = std::make_shared<ContextHostObject>(
+          rt, self->callInvoker_, self, self->requireRuntime(rt).createContext());
+      return jsi::Object::createFromHostObject(rt, std::move(context));
+    });
+  }
+  if (property == "addModule") {
+    return makeFunction(runtime, "addModule", 2, [weakSelf](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS runtime is unavailable");
+      }
+      self->requireRuntime(rt).addModule(
+          requiredString(rt, args, count, 0, "Module name"),
+          requiredString(rt, args, count, 1, "Module source"));
+      return jsi::Value::undefined();
+    });
+  }
+  if (property == "removeModule" || property == "clearModules") {
+    return makeFunction(runtime, property.c_str(), property == "removeModule" ? 1 : 0,
+        [weakSelf, property](jsi::Runtime& rt, const jsi::Value&,
+                            const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS runtime is unavailable");
+      }
+      auto& quickjs = self->requireRuntime(rt);
+      if (property == "removeModule") {
+        quickjs.removeModule(requiredString(rt, args, count, 0, "Module name"));
+      } else {
+        quickjs.clearModules();
+      }
+      return jsi::Value::undefined();
+    });
+  }
+  if (property == "cancel" || property == "resetCancellation") {
+    return makeFunction(runtime, property.c_str(), 0, [weakSelf, property](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value*, std::size_t) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS runtime is unavailable");
+      }
+      auto& quickjs = self->requireRuntime(rt);
+      if (property == "cancel") {
+        quickjs.requestCancellation();
+      } else {
+        quickjs.resetCancellation();
+      }
+      return jsi::Value::undefined();
+    });
+  }
+  if (property == "setExecutionLimitMs" ||
+      property == "setMemoryLimitBytes" || property == "setMaxStackBytes") {
+    return makeFunction(runtime, property.c_str(), 1, [weakSelf, property](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS runtime is unavailable");
+      }
+      if (count == 0 || !args[0].isNumber() ||
+          !std::isfinite(args[0].asNumber()) || args[0].asNumber() < 0) {
+        throw jsi::JSError(rt, "QuickJS limit must be a non-negative finite number");
+      }
+      auto& quickjs = self->requireRuntime(rt);
+      if (property == "setExecutionLimitMs") {
+        quickjs.setExecutionLimitMs(static_cast<std::int64_t>(args[0].asNumber()));
+      } else if (property == "setMemoryLimitBytes") {
+        quickjs.setMemoryLimitBytes(static_cast<std::size_t>(args[0].asNumber()));
+      } else {
+        quickjs.setMaxStackBytes(static_cast<std::size_t>(args[0].asNumber()));
+      }
+      return jsi::Value::undefined();
+    });
+  }
+  if (property == "dispose") {
+    return makeFunction(runtime, "dispose", 0, [weakSelf](
+        jsi::Runtime&, const jsi::Value&, const jsi::Value*, std::size_t) {
+      if (const auto self = weakSelf.lock(); self && self->runtime_) {
+        self->runtime_->dispose();
+      }
+      return jsi::Value::undefined();
+    });
+  }
+  return jsi::Value::undefined();
+}
+
+jsi::Value ContextHostObject::get(
+    jsi::Runtime& runtime,
+    const jsi::PropNameID& name) {
+  const auto property = name.utf8(runtime);
+  if (property == "valid") {
+    return jsi::Value(context_ && context_->isOpen());
+  }
+  if (property == "outputCount") {
+    return jsi::Value(static_cast<double>(
+        context_ && context_->isOpen() ? context_->outputCount() : 0));
+  }
+  if (property == "outputTruncated") {
+    return jsi::Value(
+        context_ && context_->isOpen() && context_->outputWasTruncated());
+  }
+
+  const std::weak_ptr<ContextHostObject> weakSelf = shared_from_this();
+  if (property == "evaluate") {
+    return makeFunction(runtime, "evaluate", 2, [weakSelf](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS context is unavailable");
+      }
+      const auto source = requiredString(rt, args, count, 0, "Source");
+      std::string filename = "<eval>";
+      auto mode = rnquickjs::EvalMode::Script;
+      if (count > 1 && !args[1].isUndefined()) {
+        if (!args[1].isObject()) {
+          throw jsi::JSError(rt, "Evaluate options must be an object");
+        }
+        const auto options = args[1].asObject(rt);
+        if (!isPlainObject(rt, options)) {
+          throw jsi::JSError(rt, "Evaluate options must be a plain object");
+        }
+        const auto filenameValue = options.getProperty(rt, "filename");
+        if (!filenameValue.isUndefined()) {
+          if (!filenameValue.isString()) {
+            throw jsi::JSError(rt, "Evaluate filename must be a string");
+          }
+          filename = filenameValue.asString(rt).utf8(rt);
+        }
+        mode = evalMode(rt, options);
+      }
+      return resultToJSI(rt, self->requireContext(rt).evaluate(source, filename, mode));
+    });
+  }
+  if (property == "retain") {
+    return makeFunction(runtime, "retain", 2, [weakSelf](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS context is unavailable");
+      }
+      const auto source = requiredString(rt, args, count, 0, "Retained source or global");
+      bool global = false;
+      std::string filename = "<retain>";
+      if (count > 1 && !args[1].isUndefined()) {
+        if (!args[1].isObject()) {
+          throw jsi::JSError(rt, "Retain options must be an object");
+        }
+        const auto options = args[1].asObject(rt);
+        if (!isPlainObject(rt, options)) {
+          throw jsi::JSError(rt, "Retain options must be a plain object");
+        }
+        const auto globalValue = options.getProperty(rt, "global");
+        if (!globalValue.isUndefined()) {
+          if (!globalValue.isBool()) {
+            throw jsi::JSError(rt, "Retain global must be a boolean");
+          }
+          global = globalValue.getBool();
+        }
+        const auto filenameValue = options.getProperty(rt, "filename");
+        if (!filenameValue.isUndefined()) {
+          if (!filenameValue.isString()) {
+            throw jsi::JSError(rt, "Retain filename must be a string");
+          }
+          filename = filenameValue.asString(rt).utf8(rt);
+        }
+      }
+      auto& quickjs = self->requireContext(rt);
+      const auto handle = global ? quickjs.retainGlobal(source)
+                                 : quickjs.retainEvaluation(source, filename);
+      return jsi::Value(static_cast<double>(handle));
+    });
+  }
+  if (property == "call") {
+    return makeFunction(runtime, "call", 2, [weakSelf](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS context is unavailable");
+      }
+      const auto handle = requiredHandle(rt, args, count, 0);
+      std::vector<rnquickjs::Value> values;
+      if (count > 1 && !args[1].isUndefined()) {
+        if (!args[1].isObject() || !args[1].asObject(rt).isArray(rt)) {
+          throw jsi::JSError(rt, "QuickJS call arguments must be an array");
+        }
+        const auto array = args[1].asObject(rt).asArray(rt);
+        const auto size = array.size(rt);
+        values.reserve(size);
+        std::size_t nodes = 0;
+        for (std::size_t index = 0; index < size; ++index) {
+          const auto value = array.getValueAtIndex(rt, index);
+          values.push_back(fromJSI(rt, value, 0, nodes));
+        }
+      }
+      return resultToJSI(rt, self->requireContext(rt).call(handle, values));
+    });
+  }
+  if (property == "release") {
+    return makeFunction(runtime, "release", 1, [weakSelf](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS context is unavailable");
+      }
+      self->requireContext(rt).release(requiredHandle(rt, args, count, 0));
+      return jsi::Value::undefined();
+    });
+  }
+  if (property == "executePendingJobs") {
+    return makeFunction(runtime, "executePendingJobs", 1, [weakSelf](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS context is unavailable");
+      }
+      std::size_t maxJobs = 1'000;
+      if (count > 0 && !args[0].isUndefined()) {
+        if (!args[0].isNumber() || !std::isfinite(args[0].asNumber()) ||
+            args[0].asNumber() < 0 || args[0].asNumber() > kMaxSafeInteger) {
+          throw jsi::JSError(rt, "maxJobs must be a non-negative finite number");
+        }
+        maxJobs = static_cast<std::size_t>(args[0].asNumber());
+      }
+      return resultToJSI(rt, self->requireContext(rt).executePendingJobs(maxJobs));
+    });
+  }
+  if (property == "getOutput" || property == "takeOutput") {
+    return makeFunction(runtime, property.c_str(), 1, [weakSelf, property](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS context is unavailable");
+      }
+      std::size_t requested = 0;
+      if (count > 0 && !args[0].isUndefined()) {
+        if (!args[0].isNumber() || !std::isfinite(args[0].asNumber()) ||
+            args[0].asNumber() < 0 || args[0].asNumber() > kMaxSafeInteger) {
+          throw jsi::JSError(rt, "Output count must be a non-negative finite number");
+        }
+        requested = static_cast<std::size_t>(args[0].asNumber());
+      }
+      auto& quickjs = self->requireContext(rt);
+      const auto output = property == "getOutput"
+          ? quickjs.getOutput(requested) : quickjs.takeOutput(requested);
+      return jsi::String::createFromUtf8(rt, output);
+    });
+  }
+  if (property == "registerHostFunction") {
+    return makeFunction(runtime, "registerHostFunction", 2, [weakSelf](
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, std::size_t count) {
+      const auto self = weakSelf.lock();
+      if (!self) {
+        throw jsi::JSError(rt, "QuickJS context is unavailable");
+      }
+      const auto functionName = requiredString(rt, args, count, 0, "Host function name");
+      if (count < 2 || !args[1].isObject() ||
+          !args[1].asObject(rt).isFunction(rt)) {
+        throw jsi::JSError(rt, "Host callback must be a function");
+      }
+      auto callback = std::make_shared<jsi::Function>(
+          args[1].asObject(rt).asFunction(rt));
+      auto* hostRuntime = &self->hostRuntime_;
+      const auto invoker = self->callInvoker_;
+      const auto jsThread = self->jsThread_;
+      self->requireContext(rt).registerHostFunction(
+          functionName,
+          [hostRuntime, invoker, jsThread, callback](
+              const std::vector<rnquickjs::Value>& values) {
+            return invokeOnJSThread(*hostRuntime, invoker, jsThread, callback, values);
+          });
+      return jsi::Value::undefined();
+    });
+  }
+  if (property == "dispose") {
+    return makeFunction(runtime, "dispose", 0, [weakSelf](
+        jsi::Runtime&, const jsi::Value&, const jsi::Value*, std::size_t) {
+      if (const auto self = weakSelf.lock(); self && self->context_) {
+        self->context_->dispose();
+      }
+      return jsi::Value::undefined();
+    });
+  }
+  return jsi::Value::undefined();
+}
+
+} // namespace
+
+void install(
+    facebook::jsi::Runtime& runtime,
+    std::shared_ptr<facebook::react::CallInvoker> callInvoker) {
+  const auto runtimeInvoker = callInvoker;
+  auto factory = makeFunction(runtime, kFactoryName, 1, [runtimeInvoker](
+      jsi::Runtime& hostRuntime, const jsi::Value&, const jsi::Value* arguments,
+      std::size_t count) {
+    auto hostObject = std::make_shared<RuntimeHostObject>(
+        runtimeInvoker, runtimeOptions(hostRuntime, arguments, count));
+    return jsi::Object::createFromHostObject(hostRuntime, std::move(hostObject));
+  });
+  runtime.global().setProperty(runtime, kFactoryName, std::move(factory));
+
+  auto workerFactory = makeFunction(
+      runtime,
+      kWorkerFactoryName,
+      1,
+      [callInvoker = std::move(callInvoker)](
+          jsi::Runtime& hostRuntime,
+          const jsi::Value&,
+          const jsi::Value* arguments,
+          std::size_t count) {
+        auto worker = std::make_shared<WorkerHostObject>(
+            hostRuntime,
+            callInvoker,
+            runtimeOptions(hostRuntime, arguments, count));
+        return jsi::Object::createFromHostObject(
+            hostRuntime, std::move(worker));
+      });
+  runtime.global().setProperty(
+      runtime, kWorkerFactoryName, std::move(workerFactory));
+}
+
+void cleanup(facebook::jsi::Runtime& runtime) {
+  runtime.global().setProperty(
+      runtime, kFactoryName, facebook::jsi::Value::undefined());
+  runtime.global().setProperty(
+      runtime, kWorkerFactoryName, facebook::jsi::Value::undefined());
+}
+
+} // namespace SKRNNativeQuickJS

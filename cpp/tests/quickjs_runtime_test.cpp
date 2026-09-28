@@ -168,6 +168,35 @@ int main() {
     check(
         context->pendingAsyncCount() == 0,
         "unresolved synchronous Promise releases host resolver handles");
+
+    auto rejected = context->evaluateAwaited(
+        "await 0; throw new TypeError('x');",
+        "awaited-rejection.js",
+        EvalMode::AsyncScript);
+    check(
+        !rejected.ok() && rejected.reason == "promise-rejection" &&
+            rejected.error.name == "TypeError" &&
+            rejected.error.message == "x",
+        "awaited rejection preserves structured TypeError metadata");
+
+    auto immediateRejected = context->evaluateAwaited(
+        "throw new Error('stale');",
+        "immediate-rejection.js",
+        EvalMode::AsyncScript);
+    check(
+        !immediateRejected.ok() &&
+            immediateRejected.reason == "promise-rejection" &&
+            immediateRejected.error.message == "stale",
+        "immediate async rejection is consumed by the awaited result");
+
+    auto afterRejected = context->evaluateAwaited(
+        "await 0; 1",
+        "after-rejection.js",
+        EvalMode::AsyncScript);
+    check(
+        afterRejected.ok() && afterRejected.value.has_value() &&
+            number(*afterRejected.value) == 1,
+        "handled top-level rejection does not leak into later evaluation");
   }
 
   {
@@ -237,8 +266,8 @@ int main() {
             number(*result.value) == 42,
         "native disposal is deferred while QuickJS is executing");
     check(
-        context->isOpen() && runtime.isOpen(),
-        "reentrant disposal leaves the active context/runtime intact");
+        !context->isOpen() && runtime.isOpen(),
+        "deferred context disposal completes after the outer execution turn");
   }
 
   {
@@ -259,8 +288,32 @@ int main() {
             number(*result.value) == 42,
         "disposing another context cannot disrupt active runtime execution");
     check(
-        first->isOpen(),
-        "context disposal is refused while sibling context executes");
+        !first->isOpen(),
+        "sibling context disposal is deferred until runtime execution is idle");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto first = runtime.createContext();
+    std::weak_ptr<QuickJSContext> firstWeak = first;
+    auto second = runtime.createContext();
+    second->registerHostFunction(
+        "releaseSiblingWrapper",
+        [&first](const std::vector<Value>&) -> Value {
+          first->dispose();
+          first.reset();
+          return Value{true};
+        });
+    auto result = second->evaluate(
+        "releaseSiblingWrapper(); 42",
+        "deferred-context-destruction.js");
+    check(
+        result.ok() && result.value.has_value() &&
+            number(*result.value) == 42,
+        "sibling wrapper release cannot corrupt active runtime execution");
+    check(
+        firstWeak.expired(),
+        "deferred context disposal completes after outer execution ends");
   }
 
   {

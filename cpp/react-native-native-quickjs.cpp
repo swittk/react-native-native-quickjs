@@ -1206,7 +1206,7 @@ class ContextHostObject final : public jsi::HostObject,
       jsi::Runtime& hostRuntime,
       std::shared_ptr<CallInvoker> callInvoker,
       std::shared_ptr<RuntimeHostObject> owner,
-      std::unique_ptr<rnquickjs::QuickJSContext> context)
+      std::shared_ptr<rnquickjs::QuickJSContext> context)
       : hostRuntime_(hostRuntime),
         callInvoker_(std::move(callInvoker)),
         owner_(std::move(owner)),
@@ -1245,7 +1245,7 @@ class ContextHostObject final : public jsi::HostObject,
   jsi::Runtime& hostRuntime_;
   std::shared_ptr<CallInvoker> callInvoker_;
   std::shared_ptr<RuntimeHostObject> owner_;
-  std::unique_ptr<rnquickjs::QuickJSContext> context_;
+  std::shared_ptr<rnquickjs::QuickJSContext> context_;
   std::thread::id jsThread_;
 };
 
@@ -1409,7 +1409,10 @@ jsi::Value RuntimeHostObject::get(
     return makeFunction(runtime, "dispose", 0, [weakSelf](
         jsi::Runtime& rt, const jsi::Value&, const jsi::Value*, std::size_t) {
       if (const auto self = weakSelf.lock(); self && self->runtime_) {
-        auto& quickjs = self->requireRuntime(rt);
+        if (!self->runtime_->isOpen()) {
+          return jsi::Value::undefined();
+        }
+        auto& quickjs = *self->runtime_;
         if (quickjs.isExecuting()) {
           throw jsi::JSError(
               rt, "Cannot dispose a QuickJS runtime while it is executing");
@@ -1613,7 +1616,10 @@ jsi::Value ContextHostObject::get(
     return makeFunction(runtime, "dispose", 0, [weakSelf](
         jsi::Runtime& rt, const jsi::Value&, const jsi::Value*, std::size_t) {
       if (const auto self = weakSelf.lock(); self && self->context_) {
-        auto& quickjs = self->requireContext(rt);
+        if (!self->context_->isOpen()) {
+          return jsi::Value::undefined();
+        }
+        auto& quickjs = *self->context_;
         if (!quickjs.canDispose()) {
           throw jsi::JSError(
               rt, "Cannot dispose a QuickJS context while it is executing");

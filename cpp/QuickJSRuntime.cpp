@@ -104,11 +104,16 @@ QuickJSRuntime::~QuickJSRuntime() {
   dispose();
 }
 
-std::unique_ptr<QuickJSContext> QuickJSRuntime::createContext() {
+std::shared_ptr<QuickJSContext> QuickJSRuntime::createContext() {
   if (!isOpen()) {
     throw std::runtime_error("QuickJS runtime is disposed");
   }
-  return std::make_unique<QuickJSContext>(*this);
+  auto context = std::make_shared<QuickJSContext>(*this);
+  {
+    std::lock_guard<std::mutex> lock(contextsMutex_);
+    contexts_.push_back(context);
+  }
+  return context;
 }
 
 void QuickJSRuntime::addModule(std::string name, std::string source) {
@@ -131,9 +136,13 @@ void QuickJSRuntime::clearModules() {
 
 void QuickJSRuntime::requestCancellation() noexcept {
   cancellationRequested_.store(true, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lock(contextsMutex_);
-  for (QuickJSContext* context : contexts_) {
-    if (context != nullptr) {
+  std::vector<std::shared_ptr<QuickJSContext>> contexts;
+  {
+    std::lock_guard<std::mutex> lock(contextsMutex_);
+    contexts = contexts_;
+  }
+  for (const auto& context : contexts) {
+    if (context) {
       context->notifyAsyncActivity();
     }
   }
@@ -201,13 +210,13 @@ void QuickJSRuntime::dispose() noexcept {
     return;
   }
 
-  std::vector<QuickJSContext*> contexts;
+  std::vector<std::shared_ptr<QuickJSContext>> contexts;
   {
     std::lock_guard<std::mutex> lock(contextsMutex_);
     contexts = contexts_;
   }
-  for (QuickJSContext* context : contexts) {
-    if (context != nullptr) {
+  for (const auto& context : contexts) {
+    if (context) {
       context->dispose();
     }
   }
@@ -238,24 +247,42 @@ int QuickJSRuntime::interruptHandler(JSRuntime*, void* opaque) {
 
 void QuickJSRuntime::promiseRejectionTracker(
     JSContext* context,
-    JSValueConst,
+    JSValueConst promise,
     JSValueConst reason,
     int isHandled,
     void* opaque) {
   auto* runtime = static_cast<QuickJSRuntime*>(opaque);
-  if (runtime == nullptr) {
+  if (runtime == nullptr || !JS_IsObject(promise)) {
+    return;
+  }
+
+  const void* identity = JS_VALUE_GET_PTR(promise);
+  if (identity == nullptr) {
     return;
   }
 
   std::lock_guard<std::mutex> lock(runtime->rejectionMutex_);
   if (isHandled) {
-    runtime->unhandledRejection_.clear();
+    runtime->unhandledRejections_.erase(identity);
     return;
   }
 
-  const std::string message = toString(context, reason);
-  runtime->unhandledRejection_ =
-      message.empty() ? "Unhandled promise rejection" : message;
+  ErrorInfo error;
+  if (JS_IsError(context, reason)) {
+    error.name = stringProperty(context, reason, "name");
+    error.message = stringProperty(context, reason, "message");
+    error.stack = stringProperty(context, reason, "stack");
+  }
+  if (error.message.empty()) {
+    error.message = toString(context, reason);
+  }
+  if (error.name.empty()) {
+    error.name = "UnhandledPromiseRejection";
+  }
+  if (error.message.empty()) {
+    error.message = "Unhandled promise rejection";
+  }
+  runtime->unhandledRejections_[identity] = std::move(error);
 }
 
 JSModuleDef* QuickJSRuntime::moduleLoader(
@@ -310,6 +337,7 @@ void QuickJSRuntime::endExecution() noexcept {
   executionDepth_ -= 1;
   if (executionDepth_ == 0) {
     deadlineNs_.store(0, std::memory_order_relaxed);
+    flushDeferredContextDisposals();
   }
 }
 
@@ -318,11 +346,40 @@ bool QuickJSRuntime::deadlineExceeded() const noexcept {
   return deadline > 0 && nowNs() >= deadline;
 }
 
-std::string QuickJSRuntime::consumeUnhandledRejection() {
+std::optional<ErrorInfo> QuickJSRuntime::consumeUnhandledRejection() {
   std::lock_guard<std::mutex> lock(rejectionMutex_);
-  std::string value = std::move(unhandledRejection_);
-  unhandledRejection_.clear();
+  if (unhandledRejections_.empty()) {
+    return std::nullopt;
+  }
+  auto found = unhandledRejections_.begin();
+  ErrorInfo value = std::move(found->second);
+  unhandledRejections_.erase(found);
   return value;
+}
+
+void QuickJSRuntime::forgetContext(QuickJSContext* context) noexcept {
+  std::lock_guard<std::mutex> lock(contextsMutex_);
+  contexts_.erase(
+      std::remove_if(
+          contexts_.begin(),
+          contexts_.end(),
+          [context](const std::shared_ptr<QuickJSContext>& item) {
+            return item.get() == context;
+          }),
+      contexts_.end());
+}
+
+void QuickJSRuntime::flushDeferredContextDisposals() noexcept {
+  std::vector<std::shared_ptr<QuickJSContext>> contexts;
+  {
+    std::lock_guard<std::mutex> lock(contextsMutex_);
+    contexts = contexts_;
+  }
+  for (const auto& context : contexts) {
+    if (context && context->disposeRequested_) {
+      context->dispose();
+    }
+  }
 }
 
 QuickJSContext::QuickJSContext(QuickJSRuntime& runtime)
@@ -335,10 +392,30 @@ QuickJSContext::QuickJSContext(QuickJSRuntime& runtime)
     throw std::runtime_error("Unable to allocate QuickJS context");
   }
   JS_SetContextOpaque(context_, this);
-  {
-    std::lock_guard<std::mutex> lock(runtime_.contextsMutex_);
-    runtime_.contexts_.push_back(this);
+
+  JSValue global = JS_GetGlobalObject(context_);
+  JSValue promise = JS_GetPropertyStr(context_, global, "Promise");
+  JSValue prototype = JS_IsObject(promise)
+      ? JS_GetPropertyStr(context_, promise, "prototype")
+      : JS_UNDEFINED;
+  JSValue thenFunction = JS_IsObject(prototype)
+      ? JS_GetPropertyStr(context_, prototype, "then")
+      : JS_UNDEFINED;
+  JS_FreeValue(context_, prototype);
+  JS_FreeValue(context_, promise);
+  JS_FreeValue(context_, global);
+  if (JS_IsException(thenFunction) || !JS_IsFunction(context_, thenFunction)) {
+    if (!JS_IsException(thenFunction)) {
+      JS_FreeValue(context_, thenFunction);
+    } else {
+      (void)takeExceptionInfo();
+    }
+    JS_FreeContext(context_);
+    context_ = nullptr;
+    throw std::runtime_error("Unable to capture QuickJS Promise.prototype.then");
   }
+  promiseThen_ = thenFunction;
+
   installConsole();
 }
 
@@ -717,14 +794,10 @@ ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
     result.reason = "job-limit";
     result.code = 1005;
     result.error.message = "QuickJS pending-job limit exceeded";
-  } else {
-    const std::string rejection = runtime_.consumeUnhandledRejection();
-    if (!rejection.empty()) {
-      result.reason = "promise-rejection";
-      result.code = 1006;
-      result.error.name = "UnhandledPromiseRejection";
-      result.error.message = rejection;
-    }
+  } else if (auto rejection = runtime_.consumeUnhandledRejection()) {
+    result.reason = "promise-rejection";
+    result.code = 1006;
+    result.error = std::move(*rejection);
   }
   result.durationMs = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - started)
@@ -824,6 +897,38 @@ void QuickJSContext::clearPendingAsyncPromises() noexcept {
   }
 }
 
+bool QuickJSContext::markPromiseHandled(JSValueConst promise) {
+  if (context_ == nullptr || JS_IsUndefined(promiseThen_)) {
+    return false;
+  }
+
+  JSValue onFulfilled = JS_NewCFunction(
+      context_, &QuickJSContext::promiseHandledThunk, "quickjsAwaitFulfilled", 1);
+  JSValue onRejected = JS_NewCFunction(
+      context_, &QuickJSContext::promiseHandledThunk, "quickjsAwaitRejected", 1);
+  if (JS_IsException(onFulfilled) || JS_IsException(onRejected)) {
+    if (!JS_IsException(onFulfilled)) {
+      JS_FreeValue(context_, onFulfilled);
+    }
+    if (!JS_IsException(onRejected)) {
+      JS_FreeValue(context_, onRejected);
+    }
+    (void)takeExceptionInfo();
+    return false;
+  }
+
+  JSValue args[2] = {onFulfilled, onRejected};
+  JSValue child = JS_Call(context_, promiseThen_, promise, 2, args);
+  JS_FreeValue(context_, onFulfilled);
+  JS_FreeValue(context_, onRejected);
+  if (JS_IsException(child)) {
+    (void)takeExceptionInfo();
+    return false;
+  }
+  JS_FreeValue(context_, child);
+  return true;
+}
+
 std::string QuickJSContext::getOutput(std::size_t count) const {
   std::lock_guard<std::mutex> lock(outputMutex_);
   const std::size_t take =
@@ -865,9 +970,14 @@ bool QuickJSContext::outputWasTruncated() const noexcept {
 }
 
 void QuickJSContext::dispose() noexcept {
-  if (context_ == nullptr || !canDispose()) {
+  if (context_ == nullptr) {
     return;
   }
+  if (!canDispose()) {
+    disposeRequested_ = true;
+    return;
+  }
+  disposeRequested_ = false;
 
   if (asyncState_) {
     asyncState_->alive.store(false, std::memory_order_relaxed);
@@ -888,13 +998,15 @@ void QuickJSContext::dispose() noexcept {
   hostFunctions_.clear();
   asyncHostFunctions_.clear();
 
+  if (!JS_IsUndefined(promiseThen_)) {
+    JS_FreeValue(context_, promiseThen_);
+    promiseThen_ = JS_UNDEFINED;
+  }
+
   JS_SetContextOpaque(context_, nullptr);
   JS_FreeContext(context_);
   context_ = nullptr;
-
-  std::lock_guard<std::mutex> lock(runtime_.contextsMutex_);
-  auto& contexts = runtime_.contexts_;
-  contexts.erase(std::remove(contexts.begin(), contexts.end(), this), contexts.end());
+  runtime_.forgetContext(this);
 }
 
 bool QuickJSContext::isOpen() const noexcept {
@@ -1053,6 +1165,15 @@ JSValue QuickJSContext::consoleLogThunk(
   return JS_UNDEFINED;
 }
 
+JSValue QuickJSContext::promiseHandledThunk(
+    JSContext*,
+    JSValueConst,
+    int,
+    JSValueConst*) {
+  return JS_UNDEFINED;
+}
+
+
 ExecutionResult QuickJSContext::resultFromValue(
     JSValue value,
     std::chrono::steady_clock::time_point started,
@@ -1106,6 +1227,24 @@ ExecutionResult QuickJSContext::awaitValue(
     beginExecution();
     ExecutionResult result = resultFromValue(value, started);
     endExecution();
+    return result;
+  }
+
+  beginExecution();
+  const bool handled = markPromiseHandled(value);
+  endExecution();
+  if (!handled) {
+    JS_FreeValue(context_, value);
+    ExecutionResult result;
+    result.reason = "runtime";
+    result.code = 1;
+    result.error.name = "Error";
+    result.error.message = "Unable to mark awaited QuickJS Promise as handled";
+    result.durationMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - started)
+                            .count();
+    result.memory = runtime_.memoryStats();
+    result.outputTruncated = outputWasTruncated();
     return result;
   }
 

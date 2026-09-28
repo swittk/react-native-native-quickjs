@@ -182,6 +182,11 @@ class QuickJSContext final {
       JSValueConst thisValue,
       int argc,
       JSValueConst* argv);
+  static JSValue promiseHandledThunk(
+      JSContext* ctx,
+      JSValueConst thisValue,
+      int argc,
+      JSValueConst* argv);
 
   ExecutionResult resultFromValue(
       JSValue value,
@@ -201,6 +206,7 @@ class QuickJSContext final {
   ErrorInfo errorFromValue(JSValueConst value);
   JSValue errorToJSValue(const ErrorInfo& error);
   void clearPendingAsyncPromises() noexcept;
+  bool markPromiseHandled(JSValueConst promise);
   ExecutionResult drainPendingJobsInCurrentTurn(
       std::chrono::steady_clock::time_point started,
       std::size_t maxJobs = 1'000);
@@ -240,6 +246,8 @@ class QuickJSContext final {
   int nextHostFunctionId_ = 1;
   int nextAsyncHostFunctionId_ = 1;
   std::size_t executionDepth_ = 0;
+  bool disposeRequested_ = false;
+  JSValue promiseThen_ = JS_UNDEFINED;
 
   mutable std::mutex outputMutex_;
   std::deque<std::string> output_;
@@ -255,7 +263,7 @@ class QuickJSRuntime final {
   QuickJSRuntime(const QuickJSRuntime&) = delete;
   QuickJSRuntime& operator=(const QuickJSRuntime&) = delete;
 
-  std::unique_ptr<QuickJSContext> createContext();
+  std::shared_ptr<QuickJSContext> createContext();
 
   void addModule(std::string name, std::string source);
   void removeModule(const std::string& name);
@@ -301,7 +309,9 @@ class QuickJSRuntime final {
   void beginExecution() noexcept;
   void endExecution() noexcept;
   bool deadlineExceeded() const noexcept;
-  std::string consumeUnhandledRejection();
+  std::optional<ErrorInfo> consumeUnhandledRejection();
+  void forgetContext(QuickJSContext* context) noexcept;
+  void flushDeferredContextDisposals() noexcept;
 
   RuntimeOptions options_;
   JSRuntime* runtime_ = nullptr;
@@ -313,10 +323,10 @@ class QuickJSRuntime final {
   std::unordered_map<std::string, std::string> modules_;
 
   mutable std::mutex rejectionMutex_;
-  std::string unhandledRejection_;
+  std::unordered_map<const void*, ErrorInfo> unhandledRejections_;
 
   mutable std::mutex contextsMutex_;
-  std::vector<QuickJSContext*> contexts_;
+  std::vector<std::shared_ptr<QuickJSContext>> contexts_;
 };
 
 } // namespace rnquickjs

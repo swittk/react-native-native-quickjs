@@ -77,6 +77,9 @@ importers:
       '@react-native/babel-preset':
         specifier: 0.73.21
         version: 0.73.21(@babel/core@7.29.7)(@babel/preset-env@7.29.7(@babel/core@7.29.7))
+      '@react-native/codegen':
+        specifier: 0.73.3
+        version: 0.73.3(@babel/preset-env@7.29.7(@babel/core@7.29.7))
       '@react-native/gradle-plugin':
         specifier: 0.73.4
         version: 0.73.4

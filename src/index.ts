@@ -38,6 +38,13 @@ export type QuickJSExecutionReason =
   | 'value-conversion';
 
 export interface QuickJSRuntimeOptions {
+  /**
+   * Optional per-turn guest execution deadline in milliseconds.
+   *
+   * Defaults to 0 (unlimited). Set a positive value to opt into automatic
+   * deadline interruption. `worker.cancel()` / runtime cancellation remains
+   * available even when no automatic deadline is configured.
+   */
   executionLimitMs?: number;
   memoryLimitBytes?: number;
   maxStackBytes?: number;

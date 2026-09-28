@@ -111,6 +111,89 @@ int main() {
   {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
+    std::uint64_t handle = 0;
+    context->registerHostFunction(
+        "releaseCurrentHandle",
+        [&context, &handle](const std::vector<Value>&) -> Value {
+          context->release(handle);
+          return Value{true};
+        });
+    handle = context->retainEvaluation(
+        "() => { releaseCurrentHandle(); return 42; }",
+        "release-current.js");
+    auto result = context->call(handle);
+    check(
+        result.ok() && result.value.has_value() &&
+            number(*result.value) == 42,
+        "retained function survives releasing its handle while executing");
+    auto released = context->call(handle);
+    check(
+        !released.ok() && released.reason == "invalid-handle",
+        "self-released retained handle is removed after the call");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    context->registerHostFunction(
+        "hostObject",
+        [](const std::vector<Value>&) -> Value {
+          Value::Object value;
+          value["__proto__"] = Value{"safe"};
+          value["watched"] = Value{42};
+          return Value{std::move(value)};
+        });
+    context->registerHostFunction(
+        "hostArray",
+        [](const std::vector<Value>&) -> Value {
+          return Value{Value::Array{Value{7}}};
+        });
+    auto result = context->evaluate(
+        "globalThis.setterCalls = 0;"
+        "Object.defineProperty(Object.prototype, 'watched', {"
+        "  configurable: true,"
+        "  set() { globalThis.setterCalls++; }"
+        "});"
+        "Object.defineProperty(Array.prototype, '0', {"
+        "  configurable: true,"
+        "  set() { globalThis.setterCalls++; }"
+        "});"
+        "const objectValue = hostObject();"
+        "const arrayValue = hostArray();"
+        "({"
+        "  protoOwn: Object.prototype.hasOwnProperty.call(objectValue, '__proto__'),"
+        "  protoValue: objectValue['__proto__'],"
+        "  watchedOwn: Object.prototype.hasOwnProperty.call(objectValue, 'watched'),"
+        "  watched: objectValue.watched,"
+        "  arrayOwn: Object.prototype.hasOwnProperty.call(arrayValue, '0'),"
+        "  arrayValue: arrayValue[0],"
+        "  setterCalls: globalThis.setterCalls"
+        "})",
+        "host-property-definition.js");
+    check(result.ok() && result.value.has_value(), "host property definition succeeds");
+    if (result.ok() && result.value.has_value()) {
+      const auto& value = object(*result.value);
+      check(
+          std::get<bool>(value.at("protoOwn").data) &&
+              std::get<std::string>(value.at("protoValue").data) == "safe",
+          "host __proto__ key remains an own data property");
+      check(
+          std::get<bool>(value.at("watchedOwn").data) &&
+              number(value.at("watched")) == 42,
+          "host object property bypasses guest prototype setter");
+      check(
+          std::get<bool>(value.at("arrayOwn").data) &&
+              number(value.at("arrayValue")) == 7,
+          "host array index bypasses guest prototype setter");
+      check(
+          number(value.at("setterCalls")) == 0,
+          "host value conversion does not invoke guest setters");
+    }
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
     auto setup = context->evaluate(
         "globalThis.jobValue = 0;"
         "Promise.resolve(7).then(v => { globalThis.jobValue = v * 6; });",
@@ -452,6 +535,33 @@ int main() {
   }
 
   {
+    RuntimeOptions options;
+    options.executionLimitMs = 20;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+    context->registerAsyncHostFunction(
+        "hostObjectAsync",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion complete) {
+          QuickJSContext::AsyncHostResult result;
+          Value::Object value;
+          value["answer"] = Value{42};
+          result.value = Value{std::move(value)};
+          complete(std::move(result));
+        });
+    auto result = context->evaluateAwaited(
+        "Object.defineProperty(Object.prototype, 'then', {"
+        "  configurable: true,"
+        "  get() { for (;;) {} }"
+        "});"
+        "await hostObjectAsync();",
+        "completion-then-deadline.js",
+        EvalMode::AsyncScript);
+    check(
+        !result.ok() && result.reason == "deadline",
+        "configured deadline covers async Promise resolution then-getter");
+  }
+
+  {
     rnquickjs::ExecutionResult result;
     std::atomic<std::size_t> pendingAfterCancel{999};
     std::atomic<QuickJSRuntime*> active{nullptr};
@@ -525,12 +635,53 @@ int main() {
   }
 
   {
+    rnquickjs::ExecutionResult result;
+    std::atomic<QuickJSRuntime*> active{nullptr};
+    std::mutex readyMutex;
+    std::condition_variable readyCondition;
+    bool ready = false;
+
+    std::thread worker([&] {
+      QuickJSRuntime runtime;
+      check(
+          runtime.executionLimitMs() == 0,
+          "default execution deadline is disabled");
+      auto context = runtime.createContext();
+      active.store(&runtime, std::memory_order_release);
+      {
+        std::lock_guard<std::mutex> lock(readyMutex);
+        ready = true;
+      }
+      readyCondition.notify_one();
+      result = context->evaluate("for (;;) {}", "unlimited-cancel.js");
+      active.store(nullptr, std::memory_order_release);
+    });
+
+    {
+      std::unique_lock<std::mutex> lock(readyMutex);
+      readyCondition.wait(lock, [&] { return ready; });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    if (auto* runtime = active.load(std::memory_order_acquire)) {
+      runtime->requestCancellation();
+    }
+    worker.join();
+    check(
+        result.reason == "cancelled",
+        "default-unlimited execution remains externally cancellable");
+  }
+
+  {
     RuntimeOptions options;
     options.executionLimitMs = 15;
     QuickJSRuntime runtime(options);
     auto context = runtime.createContext();
     auto result = context->evaluate("for (;;) {}", "deadline.js");
     check(!result.ok() && result.reason == "deadline", "deadline interrupts infinite loop");
+    runtime.setExecutionLimitMs(0);
+    check(
+        runtime.executionLimitMs() == 0,
+        "setExecutionLimitMs(0) disables the automatic deadline");
   }
 
   {

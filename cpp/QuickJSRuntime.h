@@ -43,7 +43,13 @@ struct Value {
 };
 
 struct RuntimeOptions {
-  std::int64_t executionLimitMs = 10'000;
+  /**
+   * Per-turn guest execution deadline in milliseconds.
+   * 0 means unlimited execution time. Unlimited is the intentional default;
+   * callers that want an automatic deadline must opt in with a positive value.
+   * Explicit requestCancellation()/worker.cancel() remains active either way.
+   */
+  std::int64_t executionLimitMs = 0;
   std::size_t memoryLimitBytes = 32 * 1024 * 1024;
   std::size_t maxStackBytes = 2 * 1024 * 1024;
   std::size_t maxOutputBytes = 64 * 1024;
@@ -207,6 +213,7 @@ class QuickJSContext final {
   JSValue errorToJSValue(const ErrorInfo& error);
   void clearPendingAsyncPromises() noexcept;
   bool markPromiseHandled(JSValueConst promise);
+  std::optional<ExecutionResult> takeAsyncCompletionFailure();
   ExecutionResult drainPendingJobsInCurrentTurn(
       std::chrono::steady_clock::time_point started,
       std::size_t maxJobs = 1'000);
@@ -264,6 +271,7 @@ class QuickJSContext final {
   std::size_t pinDepth_ = 0;
   bool disposeRequested_ = false;
   JSValue promiseThen_ = JS_UNDEFINED;
+  std::optional<ExecutionResult> asyncCompletionFailure_;
 
   mutable std::mutex outputMutex_;
   std::deque<std::string> output_;

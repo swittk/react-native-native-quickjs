@@ -33,7 +33,8 @@ by a dedicated native worker thread, so an infinite loop does not block Hermes.
 import {createQuickJSWorker} from 'react-native-native-quickjs';
 
 const worker = createQuickJSWorker({
-  executionLimitMs: 250,
+  // No execution deadline by default. Add a positive executionLimitMs only
+  // when the embedder explicitly wants automatic timeout interruption.
   memoryLimitBytes: 16 * 1024 * 1024,
   maxStackBytes: 1024 * 1024,
 });
@@ -134,12 +135,19 @@ are never exposed to React Native JavaScript.
 
 Runtime options include:
 
-- execution deadline per active JavaScript turn;
+- optional execution deadline per active JavaScript turn (`0`/omitted means
+  unlimited, which is the intentional default);
 - memory limit;
 - maximum stack size;
 - bounded console output.
 
-Time spent waiting for an external host Promise does **not** consume the
+Automatic execution deadlines are **opt-in**. The library intentionally does
+not impose a default time limit: callers may run a guest loop indefinitely and
+control its lifetime explicitly with `worker.cancel()` or runtime cancellation.
+Set a positive `executionLimitMs` only when the embedder wants an automatic
+per-turn timeout.
+
+Time spent waiting for an external host Promise does **not** consume a configured
 JavaScript execution deadline. When the Promise settles, the resumed QuickJS
 turn receives a fresh CPU budget.
 

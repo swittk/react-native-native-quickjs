@@ -258,11 +258,12 @@ rnquickjs::RuntimeOptions runtimeOptions(
   if (!isPlainObject(runtime, options)) {
     throw jsi::JSError(runtime, "Runtime options must be a plain object");
   }
-  result.executionLimitMs = static_cast<std::int64_t>(std::clamp(
-      optionalNumber(
-          runtime, options, "executionLimitMs", result.executionLimitMs),
-      1.0,
-      kMaxExecutionLimitMs));
+  const double requestedExecutionLimit = optionalNumber(
+      runtime, options, "executionLimitMs", result.executionLimitMs);
+  result.executionLimitMs = requestedExecutionLimit <= 0
+      ? 0
+      : static_cast<std::int64_t>(
+            std::min(requestedExecutionLimit, kMaxExecutionLimitMs));
   result.memoryLimitBytes = optionalSize(
       runtime, options, "memoryLimitBytes", result.memoryLimitBytes);
   result.maxStackBytes =
@@ -1390,8 +1391,11 @@ jsi::Value RuntimeHostObject::get(
       const double requested = args[0].asNumber();
       auto& quickjs = self->requireRuntime(rt);
       if (property == "setExecutionLimitMs") {
-        quickjs.setExecutionLimitMs(static_cast<std::int64_t>(
-            std::clamp(requested, 1.0, kMaxExecutionLimitMs)));
+        quickjs.setExecutionLimitMs(
+            requested <= 0
+                ? 0
+                : static_cast<std::int64_t>(
+                      std::min(requested, kMaxExecutionLimitMs)));
       } else {
         if (requested > kMaxSizeValue) {
           throw jsi::JSError(rt, "QuickJS byte limit exceeds the native size range");

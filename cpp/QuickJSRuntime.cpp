@@ -74,8 +74,10 @@ int evalFlags(EvalMode mode) noexcept {
 } // namespace
 
 QuickJSRuntime::QuickJSRuntime(RuntimeOptions options) : options_(options) {
-  options_.executionLimitMs =
-      std::clamp<std::int64_t>(options_.executionLimitMs, 1, kMaxExecutionLimitMs);
+  options_.executionLimitMs = options_.executionLimitMs <= 0
+      ? 0
+      : std::min<std::int64_t>(
+            options_.executionLimitMs, kMaxExecutionLimitMs);
   options_.memoryLimitBytes =
       std::clamp<std::size_t>(options_.memoryLimitBytes, kMinMemoryLimit, kMaxMemoryLimit);
   options_.maxStackBytes =
@@ -158,7 +160,7 @@ bool QuickJSRuntime::cancellationRequested() const noexcept {
 
 void QuickJSRuntime::setExecutionLimitMs(std::int64_t value) noexcept {
   options_.executionLimitMs =
-      std::clamp<std::int64_t>(value, 1, kMaxExecutionLimitMs);
+      value <= 0 ? 0 : std::min<std::int64_t>(value, kMaxExecutionLimitMs);
 }
 
 std::int64_t QuickJSRuntime::executionLimitMs() const noexcept {
@@ -324,8 +326,11 @@ JSModuleDef* QuickJSRuntime::moduleLoader(
 
 void QuickJSRuntime::beginExecution() noexcept {
   if (executionDepth_++ == 0) {
+    // Unlimited execution is intentional when no positive deadline was set.
+    // Explicit cancellation remains active through the interrupt handler.
+    const auto limitMs = options_.executionLimitMs;
     deadlineNs_.store(
-        nowNs() + options_.executionLimitMs * 1'000'000,
+        limitMs > 0 ? nowNs() + limitMs * 1'000'000 : 0,
         std::memory_order_relaxed);
   }
 }
@@ -678,12 +683,14 @@ ExecutionResult QuickJSContext::call(
 
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
+  JSValue function = JS_DupValue(context_, found->second);
   JSValue resultValue = JS_Call(
       context_,
-      found->second,
+      function,
       JS_UNDEFINED,
       static_cast<int>(jsArgs.size()),
       jsArgs.data());
+  JS_FreeValue(context_, function);
   for (auto value : jsArgs) {
     JS_FreeValue(context_, value);
   }
@@ -735,12 +742,14 @@ ExecutionResult QuickJSContext::callAwaited(
 
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
+  JSValue function = JS_DupValue(context_, found->second);
   JSValue resultValue = JS_Call(
       context_,
-      found->second,
+      function,
       JS_UNDEFINED,
       static_cast<int>(jsArgs.size()),
       jsArgs.data());
+  JS_FreeValue(context_, function);
   for (auto value : jsArgs) {
     JS_FreeValue(context_, value);
   }
@@ -833,6 +842,15 @@ ExecutionResult QuickJSContext::executePendingJobs(std::size_t maxJobs) {
   }
 
   processAsyncCompletions();
+  if (auto failure = takeAsyncCompletionFailure()) {
+    failure->durationMs = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+    failure->memory = runtime_.memoryStats();
+    failure->outputTruncated = outputWasTruncated();
+    return std::move(*failure);
+  }
+
   beginExecution();
   ExecutionResult result = drainPendingJobsInCurrentTurn(started, maxJobs);
   endExecution();
@@ -843,15 +861,24 @@ std::size_t QuickJSContext::processAsyncCompletions() {
   if (!isOpen() || !asyncState_) {
     return 0;
   }
+  ContextPin pin(*this);
 
   std::deque<QueuedAsyncCompletion> completions;
   {
     std::lock_guard<std::mutex> lock(asyncState_->mutex);
     completions.swap(asyncState_->completions);
   }
+  if (completions.empty()) {
+    return 0;
+  }
 
   std::size_t processed = 0;
+  beginExecution();
   for (auto& completion : completions) {
+    if (!isOpen()) {
+      break;
+    }
+
     const auto found = pendingPromises_.find(completion.requestId);
     if (found == pendingPromises_.end()) {
       continue;
@@ -864,26 +891,82 @@ std::size_t QuickJSContext::processAsyncCompletions() {
         ? found->second.resolve
         : found->second.reject;
 
+    bool interrupted = false;
     if (!JS_IsException(argument)) {
       JSValue callResult =
           JS_Call(context_, target, JS_UNDEFINED, 1, &argument);
       JS_FreeValue(context_, argument);
       if (JS_IsException(callResult)) {
-        // Clear the exception here. The Promise job/rejection path reports
-        // script-visible failures; a resolver invocation failure must not
-        // poison the next unrelated host completion.
-        (void)takeExceptionInfo();
+        ErrorInfo error = takeExceptionInfo();
+        if (runtime_.cancellationRequested() || runtime_.deadlineExceeded()) {
+          ExecutionResult failure;
+          failure.reason =
+              runtime_.cancellationRequested() ? "cancelled" : "deadline";
+          failure.code =
+              runtime_.cancellationRequested() ? 1001 : 1002;
+          failure.error = std::move(error);
+          if (failure.error.name.empty()) {
+            failure.error.name = "InternalError";
+          }
+          if (failure.error.message.empty()) {
+            failure.error.message = runtime_.cancellationRequested()
+                ? "Execution cancelled"
+                : "Execution deadline exceeded";
+          }
+          asyncCompletionFailure_ = std::move(failure);
+          interrupted = true;
+        }
       } else {
         JS_FreeValue(context_, callResult);
       }
+
+      // QuickJS Promise resolution may catch an interrupt raised while
+      // reading a thenable and convert it into a rejected Promise instead of
+      // returning JS_EXCEPTION from the resolver call. Inspect the interrupt
+      // state explicitly before the execution turn ends so a configured
+      // deadline/cancellation is surfaced to the host rather than downgraded
+      // to an ordinary guest rejection.
+      if (!interrupted &&
+          (runtime_.cancellationRequested() || runtime_.deadlineExceeded())) {
+        ExecutionResult failure;
+        failure.reason =
+            runtime_.cancellationRequested() ? "cancelled" : "deadline";
+        failure.code =
+            runtime_.cancellationRequested() ? 1001 : 1002;
+        failure.error.name = "InternalError";
+        failure.error.message = runtime_.cancellationRequested()
+            ? "Execution cancelled"
+            : "Execution deadline exceeded";
+        asyncCompletionFailure_ = std::move(failure);
+        interrupted = true;
+      }
     } else {
-      (void)takeExceptionInfo();
+      ErrorInfo error = takeExceptionInfo();
+      if (runtime_.cancellationRequested() || runtime_.deadlineExceeded()) {
+        ExecutionResult failure;
+        failure.reason =
+            runtime_.cancellationRequested() ? "cancelled" : "deadline";
+        failure.code =
+            runtime_.cancellationRequested() ? 1001 : 1002;
+        failure.error = std::move(error);
+        asyncCompletionFailure_ = std::move(failure);
+        interrupted = true;
+      }
     }
 
     JS_FreeValue(context_, found->second.resolve);
     JS_FreeValue(context_, found->second.reject);
     pendingPromises_.erase(found);
     ++processed;
+
+    if (interrupted) {
+      break;
+    }
+  }
+  endExecution();
+
+  if (asyncCompletionFailure_) {
+    clearPendingAsyncPromises();
   }
   return processed;
 }
@@ -910,6 +993,12 @@ void QuickJSContext::clearPendingAsyncPromises() noexcept {
     std::lock_guard<std::mutex> lock(asyncState_->mutex);
     asyncState_->completions.clear();
   }
+}
+
+std::optional<ExecutionResult> QuickJSContext::takeAsyncCompletionFailure() {
+  auto failure = std::move(asyncCompletionFailure_);
+  asyncCompletionFailure_.reset();
+  return failure;
 }
 
 bool QuickJSContext::markPromiseHandled(JSValueConst promise) {
@@ -1282,6 +1371,16 @@ ExecutionResult QuickJSContext::awaitValue(
     }
 
     processAsyncCompletions();
+    if (auto failure = takeAsyncCompletionFailure()) {
+      JS_FreeValue(context_, value);
+      clearPendingAsyncPromises();
+      failure->durationMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - started)
+                                .count();
+      failure->memory = runtime_.memoryStats();
+      failure->outputTruncated = outputWasTruncated();
+      return std::move(*failure);
+    }
 
     if (JS_IsJobPending(runtime_.rawRuntime())) {
       // Every active JavaScript turn gets a fresh CPU budget. Time spent idle
@@ -1472,7 +1571,8 @@ JSValue QuickJSContext::errorToJSValue(const ErrorInfo& error) {
     if (JS_IsException(item)) {
       return false;
     }
-    return JS_SetPropertyStr(context_, result, key, item) >= 0;
+    return JS_DefinePropertyValueStr(
+        context_, result, key, item, JS_PROP_C_W_E) >= 0;
   };
 
   if (!setString("name", error.name.empty() ? "Error" : error.name) ||
@@ -1647,7 +1747,8 @@ JSValue QuickJSContext::toJSValue(
     for (uint32_t index = 0; index < array->size(); ++index) {
       JSValue item = toJSValue((*array)[index], depth + 1, nodeCount);
       if (JS_IsException(item) ||
-          JS_SetPropertyUint32(context_, result, index, item) < 0) {
+          JS_DefinePropertyValueUint32(
+              context_, result, index, item, JS_PROP_C_W_E) < 0) {
         JS_FreeValue(context_, result);
         return JS_EXCEPTION;
       }
@@ -1663,7 +1764,8 @@ JSValue QuickJSContext::toJSValue(
   for (const auto& [key, itemValue] : object) {
     JSValue item = toJSValue(itemValue, depth + 1, nodeCount);
     if (JS_IsException(item) ||
-        JS_SetPropertyStr(context_, result, key.c_str(), item) < 0) {
+        JS_DefinePropertyValueStr(
+            context_, result, key.c_str(), item, JS_PROP_C_W_E) < 0) {
       JS_FreeValue(context_, result);
       return JS_EXCEPTION;
     }

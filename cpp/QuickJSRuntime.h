@@ -214,8 +214,23 @@ class QuickJSContext final {
   Value fromJSValue(JSValue value, int depth = 0, std::size_t* nodeCount = nullptr);
   JSValue toJSValue(const Value& value, int depth = 0, std::size_t* nodeCount = nullptr);
 
+  class ContextPin final {
+   public:
+    explicit ContextPin(QuickJSContext& context) noexcept : context_(context) {
+      context_.pinDepth_ += 1;
+    }
+    ~ContextPin() { context_.releasePin(); }
+
+    ContextPin(const ContextPin&) = delete;
+    ContextPin& operator=(const ContextPin&) = delete;
+
+   private:
+    QuickJSContext& context_;
+  };
+
   void installConsole();
   void appendOutput(std::string line);
+  void releasePin() noexcept;
   void beginExecution();
   void endExecution() noexcept;
 
@@ -246,6 +261,7 @@ class QuickJSContext final {
   int nextHostFunctionId_ = 1;
   int nextAsyncHostFunctionId_ = 1;
   std::size_t executionDepth_ = 0;
+  std::size_t pinDepth_ = 0;
   bool disposeRequested_ = false;
   JSValue promiseThen_ = JS_UNDEFINED;
 

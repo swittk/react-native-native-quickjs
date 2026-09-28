@@ -249,6 +249,57 @@ int main() {
   }
 
   {
+    RuntimeOptions options;
+    options.executionLimitMs = 20;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+
+    auto setup = context->evaluate(
+        "Object.defineProperty(globalThis, 'slowGlobal', {"
+        "get() { for (;;) {} }"
+        "});",
+        "retain-global-setup.js");
+    check(setup.ok(), "retainGlobal deadline setup succeeds");
+
+    const auto started = std::chrono::steady_clock::now();
+    bool threw = false;
+    try {
+      (void)context->retainGlobal("slowGlobal");
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    check(threw, "retainGlobal interrupts guest getter");
+    check(
+        elapsed.count() < 200,
+        "retainGlobal guest getter remains inside execution deadline");
+  }
+
+  {
+    RuntimeOptions options;
+    options.executionLimitMs = 20;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+
+    const auto started = std::chrono::steady_clock::now();
+    bool threw = false;
+    try {
+      (void)context->retainEvaluation(
+          "throw { toString() { for (;;) {} } }",
+          "retain-error-stringify.js");
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    check(threw, "retainEvaluation reports thrown guest value");
+    check(
+        elapsed.count() < 200,
+        "retainEvaluation exception stringification remains deadline-bounded");
+  }
+
+  {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
     context->registerHostFunction(
@@ -268,6 +319,29 @@ int main() {
     check(
         !context->isOpen() && runtime.isOpen(),
         "deferred context disposal completes after the outer execution turn");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    context->registerHostFunction(
+        "attemptAsyncDispose",
+        [&runtime, &context](const std::vector<Value>&) -> Value {
+          context->dispose();
+          runtime.dispose();
+          return Value{true};
+        });
+    auto result = context->evaluateAwaited(
+        "attemptAsyncDispose(); await 0; 42",
+        "dispose-reentrant-async.js",
+        EvalMode::AsyncScript);
+    check(
+        result.ok() && result.value.has_value() &&
+            number(*result.value) == 42,
+        "async reentrant disposal keeps context pinned through await");
+    check(
+        !context->isOpen() && runtime.isOpen(),
+        "async deferred disposal runs only after awaited value is released");
   }
 
   {

@@ -384,7 +384,7 @@ export function createQuickJSWorker(
     get executing() {
       return native.executing;
     },
-    evaluateAsync<T extends QuickJSValue = QuickJSValue>(
+    async evaluateAsync<T extends QuickJSValue = QuickJSValue>(
       source: string,
       options: QuickJSEvaluateOptions = {}
     ): Promise<QuickJSWorkerResult<T>> {
@@ -412,7 +412,7 @@ export function createQuickJSWorker(
       }
       return result.value;
     },
-    callAsync<T extends QuickJSValue = QuickJSValue>(
+    async callAsync<T extends QuickJSValue = QuickJSValue>(
       handle: number,
       args?: QuickJSValue[]
     ): Promise<QuickJSWorkerResult<T>> {

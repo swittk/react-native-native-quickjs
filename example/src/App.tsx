@@ -19,6 +19,7 @@ function describe(name: string, result: QuickJSExecutionResult): string {
 export default function App() {
   const runtimeRef = React.useRef<QuickJSRuntime>();
   const workerRef = React.useRef<QuickJSWorker>();
+  const workerRunRef = React.useRef(0);
   const [report, setReport] = React.useState('Press a demo button.');
 
   const runDemo = React.useCallback(() => {
@@ -116,6 +117,7 @@ export default function App() {
   }, []);
 
   const runWorkerDemo = React.useCallback(async () => {
+    const runId = ++workerRunRef.current;
     workerRef.current?.dispose();
     const worker = createQuickJSWorker({
       executionLimitMs: 250,
@@ -167,10 +169,13 @@ export default function App() {
       if (workerRef.current === worker) workerRef.current = undefined;
     }
 
-    setReport(lines.join('\n'));
+    if (workerRunRef.current === runId) {
+      setReport(lines.join('\n'));
+    }
   }, []);
 
   React.useEffect(() => () => {
+    workerRunRef.current += 1;
     runtimeRef.current?.dispose();
     runtimeRef.current = undefined;
     workerRef.current?.dispose();

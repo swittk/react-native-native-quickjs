@@ -6,10 +6,10 @@ buildscript {
     repositories {
       google()
       mavenCentral()
-      jcenter()
     }
     dependencies {
-      classpath "com.android.tools.build:gradle:4.2.0"
+      classpath "com.android.tools.build:gradle:8.9.1"
+      classpath "com.facebook.react:react-native-gradle-plugin"
     }
   }
 }

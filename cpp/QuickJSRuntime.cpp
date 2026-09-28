@@ -434,6 +434,8 @@ ExecutionResult QuickJSContext::evaluate(
     result.error.message = "QuickJS context is disposed";
     return result;
   }
+  ContextPin pin(*this);
+
 
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
@@ -472,6 +474,8 @@ ExecutionResult QuickJSContext::evaluateAwaited(
     result.error.message = "QuickJS context is disposed";
     return result;
   }
+  ContextPin pin(*this);
+
 
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
@@ -576,14 +580,20 @@ std::uint64_t QuickJSContext::retainGlobal(const std::string& name) {
   if (!isOpen()) {
     throw std::runtime_error("QuickJS context is disposed");
   }
+  ContextPin pin(*this);
+
+  beginExecution();
   JSValue global = JS_GetGlobalObject(context_);
   JSValue value = JS_GetPropertyStr(context_, global, name.c_str());
   JS_FreeValue(context_, global);
   if (JS_IsException(value)) {
     const ErrorInfo error = takeExceptionInfo();
+    endExecution();
     throw std::runtime_error(
         error.message.empty() ? "Unable to read global" : error.message);
   }
+  endExecution();
+
   if (!JS_IsFunction(context_, value)) {
     JS_FreeValue(context_, value);
     throw std::runtime_error("Retained global is not a function");
@@ -600,8 +610,8 @@ std::uint64_t QuickJSContext::retainEvaluation(
   if (!isOpen()) {
     throw std::runtime_error("QuickJS context is disposed");
   }
+  ContextPin pin(*this);
 
-  const auto started = std::chrono::steady_clock::now();
   beginExecution();
   JSValue value = JS_Eval(
       context_,
@@ -609,19 +619,20 @@ std::uint64_t QuickJSContext::retainEvaluation(
       source.size(),
       filename.c_str(),
       JS_EVAL_TYPE_GLOBAL);
-  endExecution();
 
   if (JS_IsException(value)) {
     const ErrorInfo error = takeExceptionInfo();
+    endExecution();
     throw std::runtime_error(
         error.message.empty() ? "Unable to retain evaluation" : error.message);
   }
+  endExecution();
+
   if (!JS_IsFunction(context_, value)) {
     JS_FreeValue(context_, value);
     throw std::runtime_error("Retained evaluation did not produce a function");
   }
 
-  (void)started;
   const std::uint64_t handle = nextHandle_++;
   retained_.emplace(handle, value);
   return handle;
@@ -637,6 +648,8 @@ ExecutionResult QuickJSContext::call(
     result.error.message = "QuickJS context is disposed";
     return result;
   }
+  ContextPin pin(*this);
+
 
   const auto found = retained_.find(handle);
   if (found == retained_.end()) {
@@ -692,6 +705,8 @@ ExecutionResult QuickJSContext::callAwaited(
     result.error.message = "QuickJS context is disposed";
     return result;
   }
+  ContextPin pin(*this);
+
 
   const auto found = retained_.find(handle);
   if (found == retained_.end()) {
@@ -1018,7 +1033,7 @@ bool QuickJSContext::isExecuting() const noexcept {
 }
 
 bool QuickJSContext::canDispose() const noexcept {
-  return !isExecuting() && !runtime_.isExecuting();
+  return pinDepth_ == 0 && !isExecuting() && !runtime_.isExecuting();
 }
 
 JSValue QuickJSContext::hostFunctionThunk(
@@ -1683,6 +1698,16 @@ void QuickJSContext::appendOutput(std::string line) {
   }
   outputBytes_ += line.size();
   output_.push_back(std::move(line));
+}
+
+void QuickJSContext::releasePin() noexcept {
+  if (pinDepth_ == 0) {
+    return;
+  }
+  pinDepth_ -= 1;
+  if (pinDepth_ == 0 && disposeRequested_) {
+    runtime_.flushDeferredContextDisposals();
+  }
 }
 
 void QuickJSContext::beginExecution() {

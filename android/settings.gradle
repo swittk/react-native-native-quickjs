@@ -1,0 +1,20 @@
+pluginManagement {
+  def configured = System.getenv("REACT_NATIVE_NODE_MODULES_DIR")
+  def nodeModules = configured != null
+      ? new File(configured).canonicalFile
+      : new File(settingsDir, "../node_modules").canonicalFile
+  def reactPlugin = new File(nodeModules, "@react-native/gradle-plugin")
+  if (!reactPlugin.isDirectory()) {
+    throw new GradleException(
+        "react-native-native-quickjs: @react-native/gradle-plugin was not found under " +
+        nodeModules)
+  }
+  includeBuild(reactPlugin)
+  repositories {
+    google()
+    mavenCentral()
+    gradlePluginPortal()
+  }
+}
+
+rootProject.name = "react-native-native-quickjs-android"

@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -333,7 +334,8 @@ class QuickJSRuntime final {
   void beginExecution() noexcept;
   void endExecution() noexcept;
   bool deadlineExceeded() const noexcept;
-  std::optional<ErrorInfo> consumeUnhandledRejection();
+  std::optional<ErrorInfo> consumeUnhandledRejection(JSContext* context);
+  void clearUnhandledRejectionsForContext(JSContext* context) noexcept;
   void forgetContext(QuickJSContext* context) noexcept;
   void flushDeferredContextDisposals() noexcept;
 
@@ -346,8 +348,14 @@ class QuickJSRuntime final {
   mutable std::mutex moduleMutex_;
   std::unordered_map<std::string, std::string> modules_;
 
+  struct UnhandledRejectionRecord {
+    JSContext* context = nullptr;
+    ErrorInfo error;
+  };
+
   mutable std::mutex rejectionMutex_;
-  std::unordered_map<const void*, ErrorInfo> unhandledRejections_;
+  std::unordered_map<const void*, UnhandledRejectionRecord> unhandledRejections_;
+  std::unordered_set<JSContext*> unhandledRejectionOverflowContexts_;
 
   mutable std::mutex contextsMutex_;
   std::vector<std::shared_ptr<QuickJSContext>> contexts_;

@@ -195,6 +195,88 @@ int main() {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
     auto setup = context->evaluate(
+        "globalThis.rejectionToStringCalled = false;"
+        "Promise.reject({"
+        "  toString() {"
+        "    globalThis.rejectionToStringCalled = true;"
+        "    Promise.reject(1);"
+        "    return 'nested';"
+        "  }"
+        "});",
+        "rejection-reentrancy.js");
+    check(setup.ok(), "reentrant rejection reason setup returns");
+    auto called = context->evaluate(
+        "globalThis.rejectionToStringCalled",
+        "rejection-reentrancy-check.js");
+    check(
+        called.ok() && called.value.has_value() &&
+            !std::get<bool>(called.value->data),
+        "rejection tracker does not execute guest toString");
+    auto rejection = context->executePendingJobs();
+    check(
+        !rejection.ok() && rejection.reason == "promise-rejection",
+        "unhandled rejection is still reported after non-reentrant capture");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto first = runtime.createContext();
+    auto second = runtime.createContext();
+
+    auto firstSetup = first->evaluate(
+        "Promise.reject(new Error('first-context'));",
+        "first-context-rejection.js");
+    auto secondSetup = second->evaluate(
+        "Promise.reject(new Error('second-context'));",
+        "second-context-rejection.js");
+    check(firstSetup.ok() && secondSetup.ok(), "cross-context rejection setup succeeds");
+
+    auto firstResult = first->executePendingJobs();
+    check(
+        !firstResult.ok() &&
+            firstResult.reason == "promise-rejection" &&
+            firstResult.error.message == "first-context",
+        "first context drains only its own rejection");
+
+    auto secondResult = second->executePendingJobs();
+    check(
+        !secondResult.ok() &&
+            secondResult.reason == "promise-rejection" &&
+            secondResult.error.message == "second-context",
+        "second context rejection remains independently reportable");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    auto setup = context->evaluate(
+        "const big = 'x'.repeat(12000);"
+        "for (let i = 0; i < 100; i++) {"
+        "  Promise.reject(new Error(big + i));"
+        "}",
+        "bounded-rejections.js");
+    check(setup.ok(), "bounded rejection flood setup succeeds");
+
+    auto rejection = context->executePendingJobs();
+    check(
+        !rejection.ok() && rejection.reason == "promise-rejection",
+        "bounded rejection flood reports one rejection");
+    check(
+        rejection.error.name.size() <= 4096 &&
+            rejection.error.message.size() <= 4096 &&
+            rejection.error.stack.size() <= 4096,
+        "host-side rejection fields stay bounded");
+
+    auto drained = context->executePendingJobs();
+    check(
+        drained.ok(),
+        "draining one rejection clears stale records for that context");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    auto setup = context->evaluate(
         "globalThis.jobValue = 0;"
         "Promise.resolve(7).then(v => { globalThis.jobValue = v * 6; });",
         "promise.js");

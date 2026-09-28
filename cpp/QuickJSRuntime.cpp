@@ -17,6 +17,8 @@ constexpr std::size_t kMaxStackSize = 32 * 1024 * 1024;
 constexpr std::int64_t kMaxExecutionLimitMs = 5 * 60 * 1000;
 constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
 constexpr std::size_t kMaxOutputLines = 10'000;
+constexpr std::size_t kMaxUnhandledRejections = 64;
+constexpr std::size_t kMaxUnhandledRejectionFieldBytes = 4 * 1024;
 constexpr int kMaxValueDepth = 32;
 constexpr std::size_t kMaxValueNodes = 16'384;
 
@@ -50,6 +52,54 @@ std::string stringProperty(
     result = toString(context, value);
   }
   JS_FreeValue(context, value);
+  return result;
+}
+
+std::string boundedStringValue(
+    JSContext* context,
+    JSValueConst value,
+    std::size_t maxBytes) {
+  if (!JS_IsString(value)) {
+    return {};
+  }
+  size_t length = 0;
+  const char* text = JS_ToCStringLen(context, &length, value);
+  if (text == nullptr) {
+    return {};
+  }
+  const std::size_t copyLength = std::min(length, maxBytes);
+  std::string result(text, copyLength);
+  JS_FreeCString(context, text);
+  return result;
+}
+
+std::string boundedOwnDataStringProperty(
+    JSContext* context,
+    JSValueConst object,
+    const char* name,
+    std::size_t maxBytes) {
+  JSAtom atom = JS_NewAtom(context, name);
+  if (atom == JS_ATOM_NULL) {
+    return {};
+  }
+
+  JSPropertyDescriptor descriptor{};
+  descriptor.value = JS_UNDEFINED;
+  descriptor.getter = JS_UNDEFINED;
+  descriptor.setter = JS_UNDEFINED;
+  const int status = JS_GetOwnProperty(context, &descriptor, object, atom);
+  JS_FreeAtom(context, atom);
+  if (status <= 0) {
+    return {};
+  }
+
+  std::string result;
+  if ((descriptor.flags & JS_PROP_GETSET) == 0) {
+    result = boundedStringValue(context, descriptor.value, maxBytes);
+  }
+  JS_FreeValue(context, descriptor.value);
+  JS_FreeValue(context, descriptor.getter);
+  JS_FreeValue(context, descriptor.setter);
   return result;
 }
 
@@ -254,7 +304,7 @@ void QuickJSRuntime::promiseRejectionTracker(
     int isHandled,
     void* opaque) {
   auto* runtime = static_cast<QuickJSRuntime*>(opaque);
-  if (runtime == nullptr || !JS_IsObject(promise)) {
+  if (runtime == nullptr || context == nullptr || !JS_IsObject(promise)) {
     return;
   }
 
@@ -263,28 +313,46 @@ void QuickJSRuntime::promiseRejectionTracker(
     return;
   }
 
-  std::lock_guard<std::mutex> lock(runtime->rejectionMutex_);
   if (isHandled) {
+    std::lock_guard<std::mutex> lock(runtime->rejectionMutex_);
     runtime->unhandledRejections_.erase(identity);
     return;
   }
 
+  // Promise rejection tracking must never invoke guest getters or toString.
+  // Capture only primitive strings and own data-string properties from Error
+  // objects, and bound every host-side allocation.
   ErrorInfo error;
   if (JS_IsError(context, reason)) {
-    error.name = stringProperty(context, reason, "name");
-    error.message = stringProperty(context, reason, "message");
-    error.stack = stringProperty(context, reason, "stack");
-  }
-  if (error.message.empty()) {
-    error.message = toString(context, reason);
-  }
-  if (error.name.empty()) {
+    error.name = boundedOwnDataStringProperty(
+        context, reason, "name", kMaxUnhandledRejectionFieldBytes);
+    error.message = boundedOwnDataStringProperty(
+        context, reason, "message", kMaxUnhandledRejectionFieldBytes);
+    error.stack = boundedOwnDataStringProperty(
+        context, reason, "stack", kMaxUnhandledRejectionFieldBytes);
+    if (error.name.empty()) {
+      error.name = "Error";
+    }
+  } else if (JS_IsString(reason)) {
+    error.name = "UnhandledPromiseRejection";
+    error.message = boundedStringValue(
+        context, reason, kMaxUnhandledRejectionFieldBytes);
+  } else {
     error.name = "UnhandledPromiseRejection";
   }
   if (error.message.empty()) {
     error.message = "Unhandled promise rejection";
   }
-  runtime->unhandledRejections_[identity] = std::move(error);
+
+  std::lock_guard<std::mutex> lock(runtime->rejectionMutex_);
+  const auto found = runtime->unhandledRejections_.find(identity);
+  if (found == runtime->unhandledRejections_.end() &&
+      runtime->unhandledRejections_.size() >= kMaxUnhandledRejections) {
+    runtime->unhandledRejectionOverflowContexts_.insert(context);
+    return;
+  }
+  runtime->unhandledRejections_[identity] =
+      UnhandledRejectionRecord{context, std::move(error)};
 }
 
 JSModuleDef* QuickJSRuntime::moduleLoader(
@@ -351,15 +419,53 @@ bool QuickJSRuntime::deadlineExceeded() const noexcept {
   return deadline > 0 && nowNs() >= deadline;
 }
 
-std::optional<ErrorInfo> QuickJSRuntime::consumeUnhandledRejection() {
-  std::lock_guard<std::mutex> lock(rejectionMutex_);
-  if (unhandledRejections_.empty()) {
+std::optional<ErrorInfo> QuickJSRuntime::consumeUnhandledRejection(
+    JSContext* context) {
+  if (context == nullptr) {
     return std::nullopt;
   }
-  auto found = unhandledRejections_.begin();
-  ErrorInfo value = std::move(found->second);
-  unhandledRejections_.erase(found);
+
+  std::lock_guard<std::mutex> lock(rejectionMutex_);
+  std::optional<ErrorInfo> value;
+  for (auto found = unhandledRejections_.begin();
+       found != unhandledRejections_.end();) {
+    if (found->second.context != context) {
+      ++found;
+      continue;
+    }
+    if (!value.has_value()) {
+      value = std::move(found->second.error);
+    }
+    found = unhandledRejections_.erase(found);
+  }
+
+  const bool overflowed =
+      unhandledRejectionOverflowContexts_.erase(context) > 0;
+  if (!value.has_value() && overflowed) {
+    ErrorInfo overflow;
+    overflow.name = "UnhandledPromiseRejection";
+    overflow.message =
+        "Unhandled promise rejection records exceeded the host-side limit";
+    value = std::move(overflow);
+  }
   return value;
+}
+
+void QuickJSRuntime::clearUnhandledRejectionsForContext(
+    JSContext* context) noexcept {
+  if (context == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(rejectionMutex_);
+  for (auto found = unhandledRejections_.begin();
+       found != unhandledRejections_.end();) {
+    if (found->second.context == context) {
+      found = unhandledRejections_.erase(found);
+    } else {
+      ++found;
+    }
+  }
+  unhandledRejectionOverflowContexts_.erase(context);
 }
 
 void QuickJSRuntime::forgetContext(QuickJSContext* context) noexcept {
@@ -818,7 +924,7 @@ ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
     result.reason = "job-limit";
     result.code = 1005;
     result.error.message = "QuickJS pending-job limit exceeded";
-  } else if (auto rejection = runtime_.consumeUnhandledRejection()) {
+  } else if (auto rejection = runtime_.consumeUnhandledRejection(context_)) {
     result.reason = "promise-rejection";
     result.code = 1006;
     result.error = std::move(*rejection);
@@ -1107,6 +1213,7 @@ void QuickJSContext::dispose() noexcept {
     promiseThen_ = JS_UNDEFINED;
   }
 
+  runtime_.clearUnhandledRejectionsForContext(context_);
   JS_SetContextOpaque(context_, nullptr);
   JS_FreeContext(context_);
   context_ = nullptr;

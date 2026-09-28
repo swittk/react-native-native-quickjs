@@ -2,14 +2,18 @@
   "compilerOptions": {
     "baseUrl": "./",
     "paths": {
-      "react-native-native-quickjs": ["./src/index"]
+      "react-native-native-quickjs": [
+        "./src/index"
+      ]
     },
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "jsx": "react",
-    "lib": ["esnext"],
+    "lib": [
+      "esnext"
+    ],
     "module": "esnext",
     "moduleResolution": "node",
     "noFallthroughCasesInSwitch": true,
@@ -21,5 +25,10 @@
     "skipLibCheck": true,
     "strict": true,
     "target": "esnext"
-  }
+  },
+  "exclude": [
+    "example",
+    "lib",
+    "node_modules"
+  ]
 }

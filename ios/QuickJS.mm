@@ -20,7 +20,7 @@ RCT_EXPORT_MODULE()
 
 + (BOOL)requiresMainQueueSetup
 {
-  return YES;
+  return NO;
 }
 
 #ifdef RCT_NEW_ARCH_ENABLED
@@ -41,36 +41,21 @@ RCT_EXPORT_MODULE()
 
 @synthesize bridge = _bridge;
 
-- (void)setBridge:(RCTBridge *)bridge
-{
-  _bridge = bridge;
-  [self installLegacyBindingsWhenReady];
-}
-
-- (void)installLegacyBindingsWhenReady
+/**
+ * Legacy RN invokes blocking synchronous methods on the JS thread. Install JSI
+ * bindings here on demand instead of mutating Hermes from setBridge: or module
+ * teardown queues.
+ */
+RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(installBindings)
 {
   RCTCxxBridge *cxxBridge = (RCTCxxBridge *)self.bridge;
-  if (cxxBridge.runtime == nullptr) {
-    __weak SKNativeQuickJS *weakSelf = self;
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_MSEC)),
-        dispatch_get_main_queue(), ^{
-          [weakSelf installLegacyBindingsWhenReady];
-        });
-    return;
+  if (cxxBridge == nil || cxxBridge.runtime == nullptr) {
+    return @NO;
   }
 
   auto *runtime = reinterpret_cast<jsi::Runtime *>(cxxBridge.runtime);
   SKRNNativeQuickJS::install(*runtime, [cxxBridge jsCallInvoker]);
-}
-
-- (void)invalidate
-{
-  RCTCxxBridge *cxxBridge = (RCTCxxBridge *)self.bridge;
-  if (cxxBridge.runtime != nullptr) {
-    auto *runtime = reinterpret_cast<jsi::Runtime *>(cxxBridge.runtime);
-    SKRNNativeQuickJS::cleanup(*runtime);
-  }
+  return @YES;
 }
 
 #endif

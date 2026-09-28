@@ -33,6 +33,7 @@ export type QuickJSExecutionReason =
   | 'invalid-handle'
   | 'job-limit'
   | 'promise-rejection'
+  | 'pending-promise'
   | 'module-denied'
   | 'value-conversion';
 
@@ -346,6 +347,23 @@ function throwWorkerResult(result: QuickJSWorkerResult): never {
   throw error;
 }
 
+function ensureJSIBindings(): void {
+  if (!NativeQuickJS) {
+    throw new Error(LINKING_ERROR);
+  }
+  if (
+    typeof globalThis.SKRNNativeQuickJSCreateRuntime === 'function' &&
+    typeof globalThis.SKRNNativeQuickJSCreateWorker === 'function'
+  ) {
+    return;
+  }
+
+  // Legacy RN exposes a blocking synchronous install hook. Because this helper
+  // is called from React Native JavaScript, the native JSI mutation happens on
+  // the JS thread instead of the native-modules/main queues.
+  NativeQuickJS.installBindings?.();
+}
+
 /**
  * Creates a QuickJS runtime/context owned by a dedicated native worker thread.
  * This is the recommended execution surface for untrusted/user-authored apps.
@@ -353,10 +371,8 @@ function throwWorkerResult(result: QuickJSWorkerResult): never {
 export function createQuickJSWorker(
   options?: QuickJSRuntimeOptions
 ): QuickJSWorker {
-  if (
-    !NativeQuickJS ||
-    typeof globalThis.SKRNNativeQuickJSCreateWorker !== 'function'
-  ) {
+  ensureJSIBindings();
+  if (typeof globalThis.SKRNNativeQuickJSCreateWorker !== 'function') {
     throw new Error(LINKING_ERROR);
   }
 
@@ -417,11 +433,8 @@ export function createQuickJSWorker(
 export function createQuickJSRuntime(
   options?: QuickJSRuntimeOptions
 ): QuickJSRuntime {
-  // Reading the module triggers either bridge installation path.
-  if (
-    !NativeQuickJS ||
-    typeof globalThis.SKRNNativeQuickJSCreateRuntime !== 'function'
-  ) {
+  ensureJSIBindings();
+  if (typeof globalThis.SKRNNativeQuickJSCreateRuntime !== 'function') {
     throw new Error(LINKING_ERROR);
   }
 

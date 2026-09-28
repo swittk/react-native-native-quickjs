@@ -155,6 +155,8 @@ class QuickJSContext final {
 
   void dispose() noexcept;
   bool isOpen() const noexcept;
+  bool isExecuting() const noexcept;
+  bool canDispose() const noexcept;
 
   JSContext* rawContext() noexcept { return context_; }
 
@@ -187,7 +189,9 @@ class QuickJSContext final {
       bool consumeValue = true);
   ExecutionResult awaitValue(
       JSValue value,
-      std::chrono::steady_clock::time_point started);
+      std::chrono::steady_clock::time_point started,
+      bool waitForAsyncCompletions = true);
+  ExecutionResult unwrapAsyncScriptResult(ExecutionResult result);
   ExecutionResult resultFromCurrentException(
       std::chrono::steady_clock::time_point started);
   ExecutionResult resultFromPromiseRejection(
@@ -235,6 +239,7 @@ class QuickJSContext final {
   std::uint64_t nextAsyncRequestId_ = 1;
   int nextHostFunctionId_ = 1;
   int nextAsyncHostFunctionId_ = 1;
+  std::size_t executionDepth_ = 0;
 
   mutable std::mutex outputMutex_;
   std::deque<std::string> output_;
@@ -273,6 +278,7 @@ class QuickJSRuntime final {
 
   void dispose() noexcept;
   bool isOpen() const noexcept;
+  bool isExecuting() const noexcept;
 
   JSRuntime* rawRuntime() noexcept { return runtime_; }
   const RuntimeOptions& options() const noexcept { return options_; }
@@ -301,6 +307,7 @@ class QuickJSRuntime final {
   JSRuntime* runtime_ = nullptr;
   std::atomic<bool> cancellationRequested_{false};
   std::atomic<std::int64_t> deadlineNs_{0};
+  std::size_t executionDepth_ = 0;
 
   mutable std::mutex moduleMutex_;
   std::unordered_map<std::string, std::string> modules_;

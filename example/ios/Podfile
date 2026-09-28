@@ -14,8 +14,6 @@ prepare_react_native_project!
 target 'QuickJSExample' do
   config = use_native_modules!
 
-  pod 'react-native-native-quickjs', :path => '../..'
-
   use_react_native!(
     :path => config[:reactNativePath],
     :flipper_configuration => FlipperConfiguration.disabled,

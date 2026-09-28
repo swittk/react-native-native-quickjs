@@ -29,6 +29,11 @@ using facebook::react::CallInvoker;
 constexpr int kMaxBridgeDepth = 32;
 constexpr std::size_t kMaxBridgeNodes = 16'384;
 constexpr double kMaxSafeInteger = 9'007'199'254'740'991.0;
+constexpr double kMaxSizeValue = std::min(
+    kMaxSafeInteger,
+    static_cast<double>(std::numeric_limits<std::size_t>::max()));
+constexpr double kMaxExecutionLimitMs = 300'000.0;
+constexpr std::size_t kMaxWorkerOutstandingTasks = 4'096;
 constexpr const char* kFactoryName = "SKRNNativeQuickJSCreateRuntime";
 constexpr const char* kWorkerFactoryName = "SKRNNativeQuickJSCreateWorker";
 
@@ -232,7 +237,7 @@ std::size_t optionalSize(
     const char* name,
     std::size_t fallback) {
   const double value = optionalNumber(runtime, object, name, fallback);
-  if (value < 0 || value > kMaxSafeInteger) {
+  if (value < 0 || value > kMaxSizeValue) {
     throw jsi::JSError(runtime, std::string(name) + " is outside the supported range");
   }
   return static_cast<std::size_t>(value);
@@ -253,8 +258,11 @@ rnquickjs::RuntimeOptions runtimeOptions(
   if (!isPlainObject(runtime, options)) {
     throw jsi::JSError(runtime, "Runtime options must be a plain object");
   }
-  result.executionLimitMs = static_cast<std::int64_t>(optionalNumber(
-      runtime, options, "executionLimitMs", result.executionLimitMs));
+  result.executionLimitMs = static_cast<std::int64_t>(std::clamp(
+      optionalNumber(
+          runtime, options, "executionLimitMs", result.executionLimitMs),
+      1.0,
+      kMaxExecutionLimitMs));
   result.memoryLimitBytes = optionalSize(
       runtime, options, "memoryLimitBytes", result.memoryLimitBytes);
   result.maxStackBytes =
@@ -912,6 +920,8 @@ class WorkerHostObject final : public jsi::HostObject,
           const jsi::Value*,
           std::size_t) -> jsi::Value {
         if (const auto self = weakSelf.lock()) {
+          self->cancellationGeneration_.fetch_add(
+              1, std::memory_order_acq_rel);
           if (auto* quickjs =
                   self->activeRuntime_.load(std::memory_order_acquire)) {
             quickjs->requestCancellation();
@@ -966,47 +976,95 @@ class WorkerHostObject final : public jsi::HostObject,
       std::function<rnquickjs::ExecutionResult(
           rnquickjs::QuickJSRuntime&,
           rnquickjs::QuickJSContext&)> operation) {
+    const auto previousOutstanding =
+        outstandingTasks_.fetch_add(1, std::memory_order_acq_rel);
+    if (previousOutstanding >= kMaxWorkerOutstandingTasks) {
+      outstandingTasks_.fetch_sub(1, std::memory_order_acq_rel);
+      throw std::runtime_error(
+          "QuickJS worker has too many outstanding tasks");
+    }
+
     const std::uint64_t taskId = nextTaskId_++;
-    enqueue([
-        this,
-        taskId,
-        operation = std::move(operation)](
-            rnquickjs::QuickJSRuntime& quickjs,
-            rnquickjs::QuickJSContext& context) mutable {
-      executing_.store(true, std::memory_order_release);
-      quickjs.resetCancellation();
+    const std::uint64_t cancellationGeneration =
+        cancellationGeneration_.load(std::memory_order_acquire);
 
-      rnquickjs::ExecutionResult result;
-      try {
-        result = operation(quickjs, context);
-      } catch (const std::exception& error) {
-        result.reason = "runtime";
-        result.code = 1;
-        result.error.name = "Error";
-        result.error.message = error.what();
-        result.memory = quickjs.memoryStats();
-        result.outputTruncated = context.outputWasTruncated();
-      } catch (...) {
-        result.reason = "runtime";
-        result.code = 1;
-        result.error.name = "Error";
-        result.error.message = "Unknown QuickJS worker failure";
-        result.memory = quickjs.memoryStats();
-        result.outputTruncated = context.outputWasTruncated();
-      }
+    try {
+      enqueue([
+          this,
+          taskId,
+          cancellationGeneration,
+          operation = std::move(operation)](
+              rnquickjs::QuickJSRuntime& quickjs,
+              rnquickjs::QuickJSContext& context) mutable {
+        executing_.store(true, std::memory_order_release);
 
-      auto output = context.takeOutput();
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        results_.push_back(
-            WorkerTaskResult{taskId, std::move(result), std::move(output)});
-        while (results_.size() > 64) {
-          results_.pop_front();
+        rnquickjs::ExecutionResult result;
+        const auto markCancelled = [&] {
+          result.reason = "cancelled";
+          result.code = 1001;
+          result.error.name = "InternalError";
+          result.error.message = "Execution cancelled";
+          result.memory = quickjs.memoryStats();
+          result.outputTruncated = context.outputWasTruncated();
+        };
+        const auto markDestroyed = [&] {
+          result.reason = "destroyed";
+          result.code = 1003;
+          result.error.name = "Error";
+          result.error.message = "QuickJS worker is disposed";
+          result.memory = quickjs.memoryStats();
+          result.outputTruncated = context.outputWasTruncated();
+        };
+
+        try {
+          if (disposed_.load(std::memory_order_acquire)) {
+            markDestroyed();
+          } else {
+            // Clear cancellation left by an earlier task, then immediately
+            // re-check the generation. A cancel that raced just before this
+            // reset is therefore not lost.
+            quickjs.resetCancellation();
+            if (disposed_.load(std::memory_order_acquire)) {
+              quickjs.requestCancellation();
+              markDestroyed();
+            } else if (
+                cancellationGeneration_.load(std::memory_order_acquire) !=
+                cancellationGeneration) {
+              quickjs.requestCancellation();
+              markCancelled();
+            } else {
+              result = operation(quickjs, context);
+            }
+          }
+        } catch (const std::exception& error) {
+          result.reason = "runtime";
+          result.code = 1;
+          result.error.name = "Error";
+          result.error.message = error.what();
+          result.memory = quickjs.memoryStats();
+          result.outputTruncated = context.outputWasTruncated();
+        } catch (...) {
+          result.reason = "runtime";
+          result.code = 1;
+          result.error.name = "Error";
+          result.error.message = "Unknown QuickJS worker failure";
+          result.memory = quickjs.memoryStats();
+          result.outputTruncated = context.outputWasTruncated();
         }
-      }
-      executing_.store(false, std::memory_order_release);
-      condition_.notify_all();
-    });
+
+        auto output = context.takeOutput();
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          results_.push_back(
+              WorkerTaskResult{taskId, std::move(result), std::move(output)});
+        }
+        executing_.store(false, std::memory_order_release);
+        condition_.notify_all();
+      });
+    } catch (...) {
+      outstandingTasks_.fetch_sub(1, std::memory_order_acq_rel);
+      throw;
+    }
     return taskId;
   }
 
@@ -1034,6 +1092,7 @@ class WorkerHostObject final : public jsi::HostObject,
     }
     WorkerTaskResult result = std::move(*found);
     results_.erase(found);
+    outstandingTasks_.fetch_sub(1, std::memory_order_acq_rel);
     return result;
   }
 
@@ -1096,6 +1155,8 @@ class WorkerHostObject final : public jsi::HostObject,
       return;
     }
 
+    cancellationGeneration_.fetch_add(
+        1, std::memory_order_acq_rel);
     if (auto* quickjs =
             activeRuntime_.load(std::memory_order_acquire)) {
       quickjs->requestCancellation();
@@ -1128,6 +1189,8 @@ class WorkerHostObject final : public jsi::HostObject,
   std::atomic<rnquickjs::QuickJSRuntime*> activeRuntime_{nullptr};
   std::atomic<bool> executing_{false};
   std::atomic<bool> disposed_{false};
+  std::atomic<std::uint64_t> cancellationGeneration_{0};
+  std::atomic<std::size_t> outstandingTasks_{0};
   bool ready_ = false;
   bool stopping_ = false;
   std::string startupError_;
@@ -1324,22 +1387,34 @@ jsi::Value RuntimeHostObject::get(
           !std::isfinite(args[0].asNumber()) || args[0].asNumber() < 0) {
         throw jsi::JSError(rt, "QuickJS limit must be a non-negative finite number");
       }
+      const double requested = args[0].asNumber();
       auto& quickjs = self->requireRuntime(rt);
       if (property == "setExecutionLimitMs") {
-        quickjs.setExecutionLimitMs(static_cast<std::int64_t>(args[0].asNumber()));
-      } else if (property == "setMemoryLimitBytes") {
-        quickjs.setMemoryLimitBytes(static_cast<std::size_t>(args[0].asNumber()));
+        quickjs.setExecutionLimitMs(static_cast<std::int64_t>(
+            std::clamp(requested, 1.0, kMaxExecutionLimitMs)));
       } else {
-        quickjs.setMaxStackBytes(static_cast<std::size_t>(args[0].asNumber()));
+        if (requested > kMaxSizeValue) {
+          throw jsi::JSError(rt, "QuickJS byte limit exceeds the native size range");
+        }
+        if (property == "setMemoryLimitBytes") {
+          quickjs.setMemoryLimitBytes(static_cast<std::size_t>(requested));
+        } else {
+          quickjs.setMaxStackBytes(static_cast<std::size_t>(requested));
+        }
       }
       return jsi::Value::undefined();
     });
   }
   if (property == "dispose") {
     return makeFunction(runtime, "dispose", 0, [weakSelf](
-        jsi::Runtime&, const jsi::Value&, const jsi::Value*, std::size_t) {
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value*, std::size_t) {
       if (const auto self = weakSelf.lock(); self && self->runtime_) {
-        self->runtime_->dispose();
+        auto& quickjs = self->requireRuntime(rt);
+        if (quickjs.isExecuting()) {
+          throw jsi::JSError(
+              rt, "Cannot dispose a QuickJS runtime while it is executing");
+        }
+        quickjs.dispose();
       }
       return jsi::Value::undefined();
     });
@@ -1536,9 +1611,14 @@ jsi::Value ContextHostObject::get(
   }
   if (property == "dispose") {
     return makeFunction(runtime, "dispose", 0, [weakSelf](
-        jsi::Runtime&, const jsi::Value&, const jsi::Value*, std::size_t) {
+        jsi::Runtime& rt, const jsi::Value&, const jsi::Value*, std::size_t) {
       if (const auto self = weakSelf.lock(); self && self->context_) {
-        self->context_->dispose();
+        auto& quickjs = self->requireContext(rt);
+        if (!quickjs.canDispose()) {
+          throw jsi::JSError(
+              rt, "Cannot dispose a QuickJS context while it is executing");
+        }
+        quickjs.dispose();
       }
       return jsi::Value::undefined();
     });

@@ -42,7 +42,6 @@ android {
 }
 
 dependencies {
-    implementation project(':react-native-native-quickjs')
     implementation("com.facebook.react:react-android")
 
     if (hermesEnabled.toBoolean()) {

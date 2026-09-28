@@ -16,7 +16,7 @@ not replace Hermes or change React Native's JavaScript engine.
 ## Installation
 
 ```sh
-yarn add react-native-native-quickjs
+pnpm add react-native-native-quickjs
 ```
 
 Run `pod install` for iOS and rebuild the native application. Expo Go cannot
@@ -175,8 +175,8 @@ synchronous embedding surface and the worker/await/hard-cancel surface.
 ## Development
 
 ```sh
-yarn test:native
-yarn typescript
+pnpm test:native
+pnpm typescript
 ```
 
 The native test compiles `quickjs.c`, `dtoa.c`, `libregexp.c`,

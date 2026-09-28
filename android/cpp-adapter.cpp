@@ -20,12 +20,3 @@ Java_com_reactnativenativequickjs_QuickJSModule_installLegacy(
       *reinterpret_cast<facebook::jsi::Runtime*>(runtimePointer),
       holder->cthis()->getCallInvoker());
 }
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_reactnativenativequickjs_QuickJSModule_cleanupLegacy(
-    JNIEnv*, jclass, jlong runtimePointer) {
-  if (runtimePointer != 0) {
-    SKRNNativeQuickJS::cleanup(
-        *reinterpret_cast<facebook::jsi::Runtime*>(runtimePointer));
-  }
-}

@@ -3,7 +3,7 @@ pluginManagement {
   if (reactPlugin == null) {
     throw new GradleException("REACT_NATIVE_GRADLE_PLUGIN_DIR is required")
   }
-  includeBuild(reactPlugin)
+  includeBuild(file(reactPlugin).canonicalFile)
   repositories {
     google()
     mavenCentral()

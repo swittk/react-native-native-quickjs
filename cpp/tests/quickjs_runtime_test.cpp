@@ -127,6 +127,145 @@ int main() {
   {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
+
+    auto syncAsync = context->evaluate(
+        "await 1; 42",
+        "sync-async.js",
+        EvalMode::AsyncScript);
+    check(
+        syncAsync.ok() && syncAsync.value.has_value() &&
+            number(*syncAsync.value) == 42,
+        "synchronous async-script evaluation settles and unwraps completion");
+
+    auto awaitedAsync = context->evaluateAwaited(
+        "await 1; 42",
+        "awaited-async.js",
+        EvalMode::AsyncScript);
+    check(
+        awaitedAsync.ok() && awaitedAsync.value.has_value() &&
+            number(*awaitedAsync.value) == 42,
+        "awaited async-script evaluation unwraps completion");
+
+    auto manyJobs = context->evaluateAwaited(
+        "let n = 0; for (let i = 0; i < 2000; i++) { await 0; n++; } n;",
+        "many-jobs.js",
+        EvalMode::AsyncScript);
+    check(
+        manyJobs.ok() && manyJobs.value.has_value() &&
+            number(*manyJobs.value) == 2000,
+        "awaited evaluation drains more than 1000 legitimate microtasks");
+
+    context->registerAsyncHostFunction(
+        "neverSync",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {});
+    auto pending = context->evaluate(
+        "await neverSync(); 42",
+        "pending-sync.js",
+        EvalMode::AsyncScript);
+    check(
+        !pending.ok() && pending.reason == "pending-promise",
+        "synchronous async evaluation reports an unresolved host Promise");
+    check(
+        context->pendingAsyncCount() == 0,
+        "unresolved synchronous Promise releases host resolver handles");
+  }
+
+  {
+    RuntimeOptions options;
+    options.executionLimitMs = 15;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+    auto conversion = context->evaluateAwaited(
+        "await 0; ({ get x() { for (;;) {} } })",
+        "conversion-deadline.js",
+        EvalMode::AsyncScript);
+    check(
+        !conversion.ok() && conversion.reason == "deadline",
+        "result conversion remains inside the execution deadline");
+  }
+
+  {
+    RuntimeOptions options;
+    options.executionLimitMs = 20;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+    context->registerHostFunction(
+        "nestedEval",
+        [&context](const std::vector<Value>&) -> Value {
+          auto nested = context->evaluate("21 * 2", "nested-inner.js");
+          if (!nested.ok() || !nested.value.has_value() ||
+              number(*nested.value) != 42) {
+            throw std::runtime_error("nested evaluation failed");
+          }
+          return Value{true};
+        });
+
+    std::thread watchdog([&runtime] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      runtime.requestCancellation();
+    });
+    const auto started = std::chrono::steady_clock::now();
+    auto result = context->evaluate(
+        "nestedEval(); for (;;) {}",
+        "nested-deadline.js");
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    watchdog.join();
+    check(
+        result.reason == "deadline",
+        "nested evaluation preserves the outer execution deadline");
+    check(
+        elapsed.count() < 200,
+        "nested evaluation does not refresh or clear the outer deadline");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    context->registerHostFunction(
+        "attemptDispose",
+        [&runtime, &context](const std::vector<Value>&) -> Value {
+          context->dispose();
+          runtime.dispose();
+          return Value{context->isOpen() && runtime.isOpen()};
+        });
+    auto result = context->evaluate(
+        "attemptDispose(); 42",
+        "dispose-reentrant.js");
+    check(
+        result.ok() && result.value.has_value() &&
+            number(*result.value) == 42,
+        "native disposal is deferred while QuickJS is executing");
+    check(
+        context->isOpen() && runtime.isOpen(),
+        "reentrant disposal leaves the active context/runtime intact");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto first = runtime.createContext();
+    auto second = runtime.createContext();
+    second->registerHostFunction(
+        "disposeOtherContext",
+        [&first](const std::vector<Value>&) -> Value {
+          first->dispose();
+          return Value{first->isOpen()};
+        });
+    auto result = second->evaluate(
+        "disposeOtherContext(); 42",
+        "cross-context-dispose.js");
+    check(
+        result.ok() && result.value.has_value() &&
+            number(*result.value) == 42,
+        "disposing another context cannot disrupt active runtime execution");
+    check(
+        first->isOpen(),
+        "context disposal is refused while sibling context executes");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
     context->registerAsyncHostFunction(
         "hostDelay",
         [](const std::vector<Value>& args, QuickJSContext::AsyncHostCompletion complete) {

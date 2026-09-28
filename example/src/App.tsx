@@ -130,7 +130,7 @@ export default function App() {
     // Hermes may return an ordinary value or Promise here. QuickJS always sees
     // a real Promise, so guest code can use normal await/Promise.all.
     worker.registerAsyncHostFunction('hostDelay', async (value, delayMs) => {
-      await new Promise(resolve => setTimeout(resolve, Number(delayMs)));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), Number(delayMs)));
       return Number(value) * 2;
     });
 

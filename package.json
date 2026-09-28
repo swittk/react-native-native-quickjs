@@ -29,12 +29,12 @@
     "!**/__mocks__"
   ],
   "scripts": {
-    "typescript": "tsc --noEmit",
+    "typescript": "tsc -p tsconfig.build.json --noEmit && pnpm --dir example exec tsc --noEmit",
     "test:native": "bash scripts/test-native-core.sh",
     "prepare": "bob build",
-    "example": "yarn --cwd example",
-    "pods": "cd example && pod-install --quiet",
-    "bootstrap": "yarn example && yarn && yarn pods"
+    "example": "pnpm --dir example",
+    "pods": "pnpm exec pod-install example/ios --quiet",
+    "bootstrap": "pnpm install && pnpm pods"
   },
   "keywords": [
     "react-native",
@@ -62,7 +62,10 @@
     "react": "19.2.0",
     "react-native": "0.83.10",
     "react-native-builder-bob": "^0.43.1",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "@babel/preset-env": "^7.25.2",
+    "@react-native/gradle-plugin": "0.83.10",
+    "@react-native/codegen": "0.83.10"
   },
   "peerDependencies": {
     "react": "*",
@@ -97,5 +100,6 @@
         }
       ]
     ]
-  }
+  },
+  "packageManager": "pnpm@10.20.0"
 }

@@ -197,7 +197,7 @@ MemoryStats QuickJSRuntime::memoryStats() const noexcept {
 }
 
 void QuickJSRuntime::dispose() noexcept {
-  if (runtime_ == nullptr) {
+  if (runtime_ == nullptr || isExecuting()) {
     return;
   }
 
@@ -222,6 +222,10 @@ void QuickJSRuntime::dispose() noexcept {
 
 bool QuickJSRuntime::isOpen() const noexcept {
   return runtime_ != nullptr;
+}
+
+bool QuickJSRuntime::isExecuting() const noexcept {
+  return executionDepth_ > 0;
 }
 
 int QuickJSRuntime::interruptHandler(JSRuntime*, void* opaque) {
@@ -292,13 +296,21 @@ JSModuleDef* QuickJSRuntime::moduleLoader(
 }
 
 void QuickJSRuntime::beginExecution() noexcept {
-  deadlineNs_.store(
-      nowNs() + options_.executionLimitMs * 1'000'000,
-      std::memory_order_relaxed);
+  if (executionDepth_++ == 0) {
+    deadlineNs_.store(
+        nowNs() + options_.executionLimitMs * 1'000'000,
+        std::memory_order_relaxed);
+  }
 }
 
 void QuickJSRuntime::endExecution() noexcept {
-  deadlineNs_.store(0, std::memory_order_relaxed);
+  if (executionDepth_ == 0) {
+    return;
+  }
+  executionDepth_ -= 1;
+  if (executionDepth_ == 0) {
+    deadlineNs_.store(0, std::memory_order_relaxed);
+  }
 }
 
 bool QuickJSRuntime::deadlineExceeded() const noexcept {
@@ -350,11 +362,26 @@ ExecutionResult QuickJSContext::evaluate(
   beginExecution();
   JSValue value = JS_Eval(
       context_, source.data(), source.size(), filename.c_str(), evalFlags(mode));
-  ExecutionResult result = JS_IsException(value)
-      ? resultFromCurrentException(started)
-      : resultFromValue(value, started);
+  if (JS_IsException(value)) {
+    ExecutionResult result = resultFromCurrentException(started);
+    endExecution();
+    return result;
+  }
+
+  if (mode == EvalMode::Script) {
+    ExecutionResult result = resultFromValue(value, started);
+    endExecution();
+    return result;
+  }
+
+  // Module and async evaluation modes return a Promise. The synchronous
+  // embedding API drains immediately runnable jobs but never blocks waiting
+  // for an external host completion.
   endExecution();
-  return result;
+  ExecutionResult result = awaitValue(value, started, false);
+  return mode == EvalMode::AsyncScript
+      ? unwrapAsyncScriptResult(std::move(result))
+      : result;
 }
 
 ExecutionResult QuickJSContext::evaluateAwaited(
@@ -379,7 +406,11 @@ ExecutionResult QuickJSContext::evaluateAwaited(
     return result;
   }
   endExecution();
-  return awaitValue(value, started);
+
+  ExecutionResult result = awaitValue(value, started, true);
+  return mode == EvalMode::AsyncScript
+      ? unwrapAsyncScriptResult(std::move(result))
+      : result;
 }
 
 void QuickJSContext::registerHostFunction(
@@ -834,7 +865,7 @@ bool QuickJSContext::outputWasTruncated() const noexcept {
 }
 
 void QuickJSContext::dispose() noexcept {
-  if (context_ == nullptr) {
+  if (context_ == nullptr || !canDispose()) {
     return;
   }
 
@@ -868,6 +899,14 @@ void QuickJSContext::dispose() noexcept {
 
 bool QuickJSContext::isOpen() const noexcept {
   return context_ != nullptr && runtime_.isOpen();
+}
+
+bool QuickJSContext::isExecuting() const noexcept {
+  return executionDepth_ > 0;
+}
+
+bool QuickJSContext::canDispose() const noexcept {
+  return !isExecuting() && !runtime_.isExecuting();
 }
 
 JSValue QuickJSContext::hostFunctionThunk(
@@ -1024,10 +1063,28 @@ ExecutionResult QuickJSContext::resultFromValue(
       result.value = fromJSValue(value);
     }
   } catch (const std::exception& error) {
-    result.reason = "value-conversion";
-    result.code = 1007;
-    result.error.name = "ValueConversionError";
-    result.error.message = error.what();
+    if (runtime_.cancellationRequested()) {
+      result.reason = "cancelled";
+      result.code = 1001;
+      result.error.name = "InternalError";
+      result.error.message = "Execution cancelled";
+    } else if (runtime_.deadlineExceeded()) {
+      result.reason = "deadline";
+      result.code = 1002;
+      result.error.name = "InternalError";
+      result.error.message = "Execution deadline exceeded";
+    } else {
+      result.reason = "value-conversion";
+      result.code = 1007;
+      result.error.name = "ValueConversionError";
+      result.error.message = error.what();
+    }
+    // A guest getter/Proxy trap may have left a QuickJS exception pending.
+    // Consume it here so a failed conversion cannot poison the next call.
+    if (context_ != nullptr) {
+      JSValue pending = JS_GetException(context_);
+      JS_FreeValue(context_, pending);
+    }
   }
 
   JS_FreeValue(context_, value);
@@ -1041,11 +1098,15 @@ ExecutionResult QuickJSContext::resultFromValue(
 
 ExecutionResult QuickJSContext::awaitValue(
     JSValue value,
-    std::chrono::steady_clock::time_point started) {
+    std::chrono::steady_clock::time_point started,
+    bool waitForAsyncCompletions) {
   const int initialPromiseState =
       JS_IsObject(value) ? static_cast<int>(JS_PromiseState(context_, value)) : -1;
   if (initialPromiseState < 0) {
-    return resultFromValue(value, started);
+    beginExecution();
+    ExecutionResult result = resultFromValue(value, started);
+    endExecution();
+    return result;
   }
 
   while (isOpen() &&
@@ -1072,7 +1133,8 @@ ExecutionResult QuickJSContext::awaitValue(
       // Every active JavaScript turn gets a fresh CPU budget. Time spent idle
       // in an external await (photo picker, BLE, database, etc.) is excluded.
       beginExecution();
-      ExecutionResult jobs = drainPendingJobsInCurrentTurn(started);
+      ExecutionResult jobs = drainPendingJobsInCurrentTurn(
+          started, std::numeric_limits<std::size_t>::max());
       endExecution();
       if (!jobs.ok()) {
         JS_FreeValue(context_, value);
@@ -1084,6 +1146,23 @@ ExecutionResult QuickJSContext::awaitValue(
 
     if (JS_PromiseState(context_, value) != JS_PROMISE_PENDING) {
       break;
+    }
+
+    if (!waitForAsyncCompletions) {
+      JS_FreeValue(context_, value);
+      clearPendingAsyncPromises();
+      ExecutionResult result;
+      result.reason = "pending-promise";
+      result.code = 1011;
+      result.error.name = "PendingPromise";
+      result.error.message =
+          "QuickJS evaluation returned a Promise that cannot settle synchronously";
+      result.durationMs = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+      result.memory = runtime_.memoryStats();
+      result.outputTruncated = outputWasTruncated();
+      return result;
     }
 
     auto state = asyncState_;
@@ -1113,12 +1192,36 @@ ExecutionResult QuickJSContext::awaitValue(
   const auto state = JS_PromiseState(context_, value);
   JSValue settled = JS_PromiseResult(context_, value);
   JS_FreeValue(context_, value);
+
+  // Property access during conversion can execute guest getters/Proxy traps.
+  // Keep the execution budget active for both fulfilled values and rejection
+  // metadata so conversion cannot bypass the deadline.
+  beginExecution();
   if (state == JS_PROMISE_REJECTED) {
     ExecutionResult result = resultFromPromiseRejection(settled, started);
     JS_FreeValue(context_, settled);
+    endExecution();
     return result;
   }
-  return resultFromValue(settled, started);
+  ExecutionResult result = resultFromValue(settled, started);
+  endExecution();
+  return result;
+}
+
+ExecutionResult QuickJSContext::unwrapAsyncScriptResult(
+    ExecutionResult result) {
+  if (!result.ok() || !result.value.has_value()) {
+    return result;
+  }
+  const auto* object = std::get_if<Value::Object>(&result.value->data);
+  if (object == nullptr) {
+    return result;
+  }
+  const auto found = object->find("value");
+  Value unwrapped =
+      found == object->end() ? Value{} : found->second;
+  result.value = std::move(unwrapped);
+  return result;
 }
 
 ExecutionResult QuickJSContext::resultFromCurrentException(
@@ -1444,10 +1547,15 @@ void QuickJSContext::appendOutput(std::string line) {
 }
 
 void QuickJSContext::beginExecution() {
+  executionDepth_ += 1;
   runtime_.beginExecution();
 }
 
 void QuickJSContext::endExecution() noexcept {
+  if (executionDepth_ == 0) {
+    return;
+  }
+  executionDepth_ -= 1;
   runtime_.endExecution();
 }
 

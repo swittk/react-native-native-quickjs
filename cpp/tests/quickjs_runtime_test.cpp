@@ -79,6 +79,40 @@ int main() {
   {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
+
+    auto hostileMetadata = context->evaluate(
+        "const error = new Error('original failure');"
+        "Object.defineProperty(error, 'name', {"
+        "  get() { throw new Error('metadata getter failure'); }"
+        "});"
+        "throw error;",
+        "hostile-error-metadata.js");
+    check(
+        !hostileMetadata.ok() &&
+            hostileMetadata.error.message == "original failure",
+        "error extraction tolerates throwing metadata getters");
+    check(
+        !JS_HasException(context->rawContext()),
+        "error metadata extraction does not leave a pending exception");
+
+    auto hostileStringify = context->evaluate(
+        "throw { toString() { throw new Error('nested stringify failure'); } };",
+        "hostile-error-stringify.js");
+    check(
+        !hostileStringify.ok() &&
+            !JS_HasException(context->rawContext()),
+        "failed exception stringification does not poison the next call");
+
+    auto afterHostileError = context->evaluate("21 * 2", "after-hostile-error.js");
+    check(
+        afterHostileError.ok() && afterHostileError.value.has_value() &&
+            number(*afterHostileError.value) == 42,
+        "context remains reusable after hostile error metadata");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
     context->registerHostFunction(
         "nativeAdd",
         [](const std::vector<Value>& args) -> Value {
@@ -372,6 +406,31 @@ int main() {
         manyJobs.ok() && manyJobs.value.has_value() &&
             number(*manyJobs.value) == 2000,
         "awaited evaluation drains more than 1000 legitimate microtasks");
+
+    Value tooDeep{1};
+    for (int depth = 0; depth < 40; ++depth) {
+      tooDeep = Value{Value::Array{std::move(tooDeep)}};
+    }
+    context->registerAsyncHostFunction(
+        "tooDeepCompletion",
+        [tooDeep = std::move(tooDeep)](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          QuickJSContext::AsyncHostResult result;
+          result.value = tooDeep;
+          complete(std::move(result));
+        });
+    auto failedCompletion = context->evaluateAwaited(
+        "await tooDeepCompletion(); 42",
+        "async-completion-conversion.js",
+        EvalMode::AsyncScript);
+    check(
+        !failedCompletion.ok() &&
+            failedCompletion.reason == "value-conversion",
+        "async completion conversion failure is surfaced");
+    check(
+        context->pendingAsyncCount() == 0,
+        "failed async completion does not orphan a pending Promise");
 
     context->registerAsyncHostFunction(
         "neverSync",
@@ -947,6 +1006,23 @@ int main() {
             std::get<std::string>(conversionFailure.value->data) ==
                 "console conversion",
         "console.log propagates guest string-conversion failures");
+  }
+
+  {
+    RuntimeOptions options;
+    options.maxOutputBytes = 8;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+    auto logged = context->evaluate(
+        "console.log('abcdefghijklmnopqrstuvwxyz'); 'ok';",
+        "console-output-bound.js");
+    check(logged.ok(), "bounded console script succeeds");
+    check(
+        context->getOutput().size() <= options.maxOutputBytes,
+        "console conversion never retains more than the configured output bytes");
+    check(
+        context->outputWasTruncated(),
+        "oversized console conversion reports truncated output");
   }
 
   {

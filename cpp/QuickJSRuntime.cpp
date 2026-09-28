@@ -28,10 +28,19 @@ std::int64_t nowNs() noexcept {
       .count();
 }
 
-std::string toString(JSContext* context, JSValueConst value) {
+void discardException(JSContext* context) noexcept {
+  if (context == nullptr || !JS_HasException(context)) {
+    return;
+  }
+  JSValue exception = JS_GetException(context);
+  JS_FreeValue(context, exception);
+}
+
+std::string bestEffortToString(JSContext* context, JSValueConst value) {
   size_t length = 0;
   const char* text = JS_ToCStringLen(context, &length, value);
   if (text == nullptr) {
+    discardException(context);
     return {};
   }
   std::string result(text, length);
@@ -45,11 +54,12 @@ std::string stringProperty(
     const char* name) {
   JSValue value = JS_GetPropertyStr(context, object, name);
   if (JS_IsException(value)) {
+    discardException(context);
     return {};
   }
   std::string result;
   if (!JS_IsUndefined(value) && !JS_IsNull(value)) {
-    result = toString(context, value);
+    result = bestEffortToString(context, value);
   }
   JS_FreeValue(context, value);
   return result;
@@ -65,6 +75,7 @@ std::string boundedStringValue(
   size_t length = 0;
   const char* text = JS_ToCStringLen(context, &length, value);
   if (text == nullptr) {
+    discardException(context);
     return {};
   }
   const std::size_t copyLength = std::min(length, maxBytes);
@@ -80,6 +91,7 @@ std::string boundedOwnDataStringProperty(
     std::size_t maxBytes) {
   JSAtom atom = JS_NewAtom(context, name);
   if (atom == JS_ATOM_NULL) {
+    discardException(context);
     return {};
   }
 
@@ -90,6 +102,9 @@ std::string boundedOwnDataStringProperty(
   const int status = JS_GetOwnProperty(context, &descriptor, object, atom);
   JS_FreeAtom(context, atom);
   if (status <= 0) {
+    if (status < 0) {
+      discardException(context);
+    }
     return {};
   }
 
@@ -920,7 +935,7 @@ ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
           error.message = stringProperty(jobContext, exception, "message");
           error.stack = stringProperty(jobContext, exception, "stack");
           if (error.message.empty()) {
-            error.message = toString(jobContext, exception);
+            error.message = bestEffortToString(jobContext, exception);
           }
         }
         JS_FreeValue(jobContext, exception);
@@ -1035,8 +1050,8 @@ std::size_t QuickJSContext::processAsyncCompletions() {
       JS_FreeValue(context_, argument);
       if (JS_IsException(callResult)) {
         ErrorInfo error = takeExceptionInfo();
+        ExecutionResult failure;
         if (runtime_.cancellationRequested() || runtime_.deadlineExceeded()) {
-          ExecutionResult failure;
           failure.reason =
               runtime_.cancellationRequested() ? "cancelled" : "deadline";
           failure.code =
@@ -1050,9 +1065,19 @@ std::size_t QuickJSContext::processAsyncCompletions() {
                 ? "Execution cancelled"
                 : "Execution deadline exceeded";
           }
-          asyncCompletionFailure_ = std::move(failure);
-          interrupted = true;
+        } else {
+          failure.reason = "runtime";
+          failure.code = 1;
+          failure.error = std::move(error);
+          if (failure.error.name.empty()) {
+            failure.error.name = "Error";
+          }
+          if (failure.error.message.empty()) {
+            failure.error.message = "Unable to settle async host Promise";
+          }
         }
+        asyncCompletionFailure_ = std::move(failure);
+        interrupted = true;
       } else {
         JS_FreeValue(context_, callResult);
       }
@@ -1079,16 +1104,34 @@ std::size_t QuickJSContext::processAsyncCompletions() {
       }
     } else {
       ErrorInfo error = takeExceptionInfo();
+      ExecutionResult failure;
       if (runtime_.cancellationRequested() || runtime_.deadlineExceeded()) {
-        ExecutionResult failure;
         failure.reason =
             runtime_.cancellationRequested() ? "cancelled" : "deadline";
         failure.code =
             runtime_.cancellationRequested() ? 1001 : 1002;
         failure.error = std::move(error);
-        asyncCompletionFailure_ = std::move(failure);
-        interrupted = true;
+        if (failure.error.name.empty()) {
+          failure.error.name = "InternalError";
+        }
+        if (failure.error.message.empty()) {
+          failure.error.message = runtime_.cancellationRequested()
+              ? "Execution cancelled"
+              : "Execution deadline exceeded";
+        }
+      } else {
+        failure.reason = "value-conversion";
+        failure.code = 1007;
+        failure.error = std::move(error);
+        if (failure.error.name.empty()) {
+          failure.error.name = "ValueConversionError";
+        }
+        if (failure.error.message.empty()) {
+          failure.error.message = "Unable to convert async host completion";
+        }
       }
+      asyncCompletionFailure_ = std::move(failure);
+      interrupted = true;
     }
 
     JS_FreeValue(context_, found->second.resolve);
@@ -1396,18 +1439,35 @@ JSValue QuickJSContext::consoleLogThunk(
     return JS_UNDEFINED;
   }
 
+  const std::size_t byteLimit = self->runtime_.options().maxOutputBytes;
   std::string line;
+  bool truncated = false;
+  const auto appendBounded = [&](const char* text, std::size_t length) {
+    const std::size_t remaining =
+        line.size() < byteLimit ? byteLimit - line.size() : 0;
+    const std::size_t copyLength = std::min(length, remaining);
+    if (copyLength > 0) {
+      line.append(text, copyLength);
+    }
+    if (copyLength < length) {
+      truncated = true;
+    }
+  };
+
   for (int index = 0; index < argc; ++index) {
     if (index > 0) {
-      line.push_back('\t');
+      appendBounded("\t", 1);
     }
     size_t length = 0;
     const char* text = JS_ToCStringLen(context, &length, argv[index]);
     if (text == nullptr) {
       return JS_EXCEPTION;
     }
-    line.append(text, length);
+    appendBounded(text, length);
     JS_FreeCString(context, text);
+  }
+  if (truncated) {
+    self->outputTruncated_.store(true, std::memory_order_relaxed);
   }
   self->appendOutput(std::move(line));
   return JS_UNDEFINED;
@@ -1693,7 +1753,7 @@ ErrorInfo QuickJSContext::errorFromValue(JSValueConst value) {
     result.stack = stringProperty(context_, value, "stack");
   }
   if (result.message.empty()) {
-    result.message = toString(context_, value);
+    result.message = bestEffortToString(context_, value);
   }
   if (result.name.empty()) {
     result.name = "Error";
@@ -1774,7 +1834,14 @@ Value QuickJSContext::fromJSValue(
     return Value{number};
   }
   if (JS_IsString(value)) {
-    return Value{toString(context_, value)};
+    size_t length = 0;
+    const char* text = JS_ToCStringLen(context_, &length, value);
+    if (text == nullptr) {
+      throw std::runtime_error("Unable to convert QuickJS string");
+    }
+    Value result{std::string(text, length)};
+    JS_FreeCString(context_, text);
+    return result;
   }
 
   if (JS_IsArray(context_, value)) {

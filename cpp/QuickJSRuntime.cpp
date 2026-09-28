@@ -614,10 +614,12 @@ void QuickJSContext::registerHostFunction(
   if (name.empty()) {
     throw std::invalid_argument("Host function name cannot be empty");
   }
+  ContextPin pin(*this);
 
   const int id = nextHostFunctionId_++;
   hostFunctions_[id] = std::move(function);
 
+  beginExecution();
   JSValue data = JS_NewInt32(context_, id);
   JSValue functionValue = JS_NewCFunctionData(
       context_,
@@ -628,20 +630,29 @@ void QuickJSContext::registerHostFunction(
       &data);
   JS_FreeValue(context_, data);
   if (JS_IsException(functionValue)) {
+    hostFunctions_.erase(id);
     const ErrorInfo error = takeExceptionInfo();
+    endExecution();
     throw std::runtime_error(
         error.message.empty() ? "Unable to create host function" : error.message);
   }
 
   JSValue global = JS_GetGlobalObject(context_);
-  if (JS_SetPropertyStr(
-          context_, global, name.c_str(), functionValue) < 0) {
+  if (JS_DefinePropertyValueStr(
+          context_,
+          global,
+          name.c_str(),
+          functionValue,
+          JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
     JS_FreeValue(context_, global);
+    hostFunctions_.erase(id);
     const ErrorInfo error = takeExceptionInfo();
+    endExecution();
     throw std::runtime_error(
         error.message.empty() ? "Unable to install host function" : error.message);
   }
   JS_FreeValue(context_, global);
+  endExecution();
 }
 
 void QuickJSContext::registerAsyncHostFunction(
@@ -653,10 +664,12 @@ void QuickJSContext::registerAsyncHostFunction(
   if (name.empty()) {
     throw std::invalid_argument("Async host function name cannot be empty");
   }
+  ContextPin pin(*this);
 
   const int id = nextAsyncHostFunctionId_++;
   asyncHostFunctions_[id] = std::move(function);
 
+  beginExecution();
   JSValue data = JS_NewInt32(context_, id);
   JSValue functionValue = JS_NewCFunctionData(
       context_,
@@ -667,7 +680,9 @@ void QuickJSContext::registerAsyncHostFunction(
       &data);
   JS_FreeValue(context_, data);
   if (JS_IsException(functionValue)) {
+    asyncHostFunctions_.erase(id);
     const ErrorInfo error = takeExceptionInfo();
+    endExecution();
     throw std::runtime_error(
         error.message.empty()
             ? "Unable to create async host function"
@@ -675,16 +690,23 @@ void QuickJSContext::registerAsyncHostFunction(
   }
 
   JSValue global = JS_GetGlobalObject(context_);
-  if (JS_SetPropertyStr(
-          context_, global, name.c_str(), functionValue) < 0) {
+  if (JS_DefinePropertyValueStr(
+          context_,
+          global,
+          name.c_str(),
+          functionValue,
+          JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
     JS_FreeValue(context_, global);
+    asyncHostFunctions_.erase(id);
     const ErrorInfo error = takeExceptionInfo();
+    endExecution();
     throw std::runtime_error(
         error.message.empty()
             ? "Unable to install async host function"
             : error.message);
   }
   JS_FreeValue(context_, global);
+  endExecution();
 }
 
 std::uint64_t QuickJSContext::retainGlobal(const std::string& name) {
@@ -1379,7 +1401,13 @@ JSValue QuickJSContext::consoleLogThunk(
     if (index > 0) {
       line.push_back('\t');
     }
-    line.append(toString(context, argv[index]));
+    size_t length = 0;
+    const char* text = JS_ToCStringLen(context, &length, argv[index]);
+    if (text == nullptr) {
+      return JS_EXCEPTION;
+    }
+    line.append(text, length);
+    JS_FreeCString(context, text);
   }
   self->appendOutput(std::move(line));
   return JS_UNDEFINED;

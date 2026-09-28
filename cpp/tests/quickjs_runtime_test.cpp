@@ -93,6 +93,59 @@ int main() {
   }
 
   {
+    RuntimeOptions options;
+    options.executionLimitMs = 20;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+
+    auto setup = context->evaluate(
+        "globalThis.registrationSetterCalls = 0;"
+        "Object.defineProperty(globalThis, 'lateSyncHost', {"
+        "  configurable: true,"
+        "  set() { globalThis.registrationSetterCalls++; }"
+        "});"
+        "Object.defineProperty(globalThis, 'lateAsyncHost', {"
+        "  configurable: true,"
+        "  set() { globalThis.registrationSetterCalls++; }"
+        "});",
+        "registration-setter-setup.js");
+    check(setup.ok(), "host registration setter setup succeeds");
+
+    context->registerHostFunction(
+        "lateSyncHost",
+        [](const std::vector<Value>&) -> Value { return Value{42}; });
+    context->registerAsyncHostFunction(
+        "lateAsyncHost",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion complete) {
+          QuickJSContext::AsyncHostResult result;
+          result.value = Value{7};
+          complete(std::move(result));
+        });
+
+    auto registered = context->evaluateAwaited(
+        "({"
+        "  setterCalls: globalThis.registrationSetterCalls,"
+        "  syncValue: lateSyncHost(),"
+        "  asyncValue: await lateAsyncHost()"
+        "})",
+        "registration-setter-check.js",
+        EvalMode::AsyncScript);
+    check(
+        registered.ok() && registered.value.has_value(),
+        "host registration bypasses guest global setters");
+    if (registered.ok() && registered.value.has_value()) {
+      const auto& value = object(*registered.value);
+      check(
+          number(value.at("setterCalls")) == 0,
+          "sync and async host registration do not invoke guest setters");
+      check(
+          number(value.at("syncValue")) == 42 &&
+              number(value.at("asyncValue")) == 7,
+          "registered host functions remain callable after safe definition");
+    }
+  }
+
+  {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
     const auto handle = context->retainEvaluation(
@@ -880,6 +933,20 @@ int main() {
     check(logged.ok(), "console script succeeds");
     check(context->getOutput() == "hello\t42", "output read is non-destructive");
     check(context->takeOutput() == "hello\t42", "console output captured");
+
+    auto conversionFailure = context->evaluate(
+        "try {"
+        "  console.log({ toString() { throw new Error('console conversion'); } });"
+        "  'not-caught';"
+        "} catch (error) {"
+        "  error.message;"
+        "}",
+        "console-conversion-error.js");
+    check(
+        conversionFailure.ok() && conversionFailure.value.has_value() &&
+            std::get<std::string>(conversionFailure.value->data) ==
+                "console conversion",
+        "console.log propagates guest string-conversion failures");
   }
 
   {

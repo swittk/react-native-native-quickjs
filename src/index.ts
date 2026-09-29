@@ -368,7 +368,11 @@ function ensureJSIBindings(): void {
   // Install synchronously from the React Native JS thread. This explicit
   // TurboModule method is used across architectures so the package does not
   // depend on version-specific JSI installer protocols.
-  NativeQuickJS.installBindings();
+  if (!NativeQuickJS.installBindings()) {
+    throw new Error(
+      "QuickJS JSI bindings could not access the React Native runtime."
+    );
+  }
 }
 
 /**

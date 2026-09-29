@@ -14,7 +14,7 @@ final class QuickJSBindingInstaller {
 
   static boolean install(ReactApplicationContext reactContext) {
     JavaScriptContextHolder jsContext = reactContext.getJavaScriptContextHolder();
-    if (jsContext == null || jsContext.get() == 0) {
+    if (jsContext == null) {
       return false;
     }
 
@@ -23,7 +23,16 @@ final class QuickJSBindingInstaller {
       return false;
     }
 
-    installNative(jsContext.get(), holder);
+    // React Native can clear the native runtime pointer during teardown.
+    // Follow JavaScriptContextHolder's synchronization contract so the pointer
+    // stays valid for the complete native installation call.
+    synchronized (jsContext) {
+      long runtimePointer = jsContext.get();
+      if (runtimePointer == 0) {
+        return false;
+      }
+      installNative(runtimePointer, holder);
+    }
     return true;
   }
 

@@ -22,11 +22,8 @@ public final class QuickJSModule extends NativeQuickJSSpec {
   }
 
   @Override
-  public void installBindings() {
-    if (!QuickJSBindingInstaller.install(reactContext)) {
-      throw new IllegalStateException(
-          "QuickJS JSI bindings could not access the React Native runtime");
-    }
+  public boolean installBindings() {
+    return QuickJSBindingInstaller.install(reactContext);
   }
 
   @NonNull

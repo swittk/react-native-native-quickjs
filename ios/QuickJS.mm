@@ -44,7 +44,7 @@ class QuickJSTurboModule final : public react::NativeQuickJSSpecJSI {
   {
     auto &module = static_cast<QuickJSTurboModule &>(turboModule);
     SKRNNativeQuickJS::install(runtime, module.jsInvoker_);
-    return jsi::Value::undefined();
+    return jsi::Value(true);
   }
 };
 } // namespace
@@ -58,8 +58,9 @@ class QuickJSTurboModule final : public react::NativeQuickJSSpecJSI {
 // Satisfies the generated NativeQuickJSSpec Objective-C protocol. New
 // Architecture calls are intercepted by QuickJSTurboModule's method map above
 // so the JSI runtime and CallInvoker are available at the install site.
-- (void)installBindings
+- (NSNumber *)installBindings
 {
+  return @YES;
 }
 
 #else

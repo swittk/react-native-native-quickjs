@@ -47,4 +47,12 @@ export ANDROID_GRADLE_PLUGIN_VERSION="$android_gradle_plugin_version"
 
 "$gradle_command" --no-daemon --console=plain -p "$repo_dir/scripts"   -PnewArchEnabled=true   :react-native-native-quickjs-validation:compileDebugJavaWithJavac   :react-native-native-quickjs-validation:externalNativeBuildDebug
 
+generated_java_spec="$repo_dir/android/build/generated/source/codegen/java/com/reactnativenativequickjs/NativeQuickJSSpec.java"
+if [[ ! -f "$generated_java_spec" ]] ||
+   ! grep -Fq '@ReactMethod(isBlockingSynchronousMethod = true)' "$generated_java_spec" ||
+   ! grep -Fq 'public abstract boolean installBindings();' "$generated_java_spec"; then
+  echo "Codegen did not generate installBindings as a blocking synchronous boolean method" >&2
+  exit 3
+fi
+
 "$gradle_command" --no-daemon --console=plain -p "$repo_dir/scripts"   -PnewArchEnabled=false   :react-native-native-quickjs-validation:compileDebugJavaWithJavac   :react-native-native-quickjs-validation:externalNativeBuildDebug

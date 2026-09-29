@@ -9,7 +9,7 @@ import type {TurboModule} from 'react-native';
  * depending on version-specific BindingsInstallerHolder protocols.
  */
 export interface Spec extends TurboModule {
-  installBindings(): void;
+  installBindings(): boolean;
 }
 
 export type RegistrationModule = Spec;

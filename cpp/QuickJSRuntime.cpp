@@ -806,10 +806,13 @@ std::uint64_t QuickJSContext::retainGlobal(const std::string& name) {
   JSValue value = JS_GetPropertyStr(context_, global, name.c_str());
   JS_FreeValue(context_, global);
   if (JS_IsException(value)) {
-    const ErrorInfo error = takeExceptionInfo();
+    ExecutionResult failure =
+        resultFromCurrentException(std::chrono::steady_clock::now());
     endExecution();
-    throw std::runtime_error(
-        error.message.empty() ? "Unable to read global" : error.message);
+    throw QuickJSExecutionException(
+        std::move(failure.reason),
+        failure.code,
+        std::move(failure.error));
   }
   endExecution();
 
@@ -840,10 +843,13 @@ std::uint64_t QuickJSContext::retainEvaluation(
       JS_EVAL_TYPE_GLOBAL);
 
   if (JS_IsException(value)) {
-    const ErrorInfo error = takeExceptionInfo();
+    ExecutionResult failure =
+        resultFromCurrentException(std::chrono::steady_clock::now());
     endExecution();
-    throw std::runtime_error(
-        error.message.empty() ? "Unable to retain evaluation" : error.message);
+    throw QuickJSExecutionException(
+        std::move(failure.reason),
+        failure.code,
+        std::move(failure.error));
   }
   endExecution();
 
@@ -1107,12 +1113,18 @@ std::size_t QuickJSContext::processAsyncCompletions() {
       continue;
     }
 
+    // Promise resolution can synchronously execute guest then-getters. Detach
+    // this resolver pair before any guest code can re-enter and mutate or
+    // clear pendingPromises_.
+    PendingPromise pending = found->second;
+    pendingPromises_.erase(found);
+
     JSValue argument = completion.result.ok
         ? toJSValue(completion.result.value)
         : errorToJSValue(completion.result.error);
     JSValue target = completion.result.ok
-        ? found->second.resolve
-        : found->second.reject;
+        ? pending.resolve
+        : pending.reject;
 
     bool interrupted = false;
     if (!JS_IsException(argument)) {
@@ -1205,9 +1217,10 @@ std::size_t QuickJSContext::processAsyncCompletions() {
       interrupted = true;
     }
 
-    JS_FreeValue(context_, found->second.resolve);
-    JS_FreeValue(context_, found->second.reject);
-    pendingPromises_.erase(found);
+    if (context_ != nullptr) {
+      JS_FreeValue(context_, pending.resolve);
+      JS_FreeValue(context_, pending.reject);
+    }
     ++processed;
 
     if (interrupted) {

@@ -11,9 +11,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -72,6 +74,28 @@ struct ErrorInfo {
   bool empty() const noexcept {
     return name.empty() && message.empty() && stack.empty();
   }
+};
+
+class QuickJSExecutionException final : public std::runtime_error {
+ public:
+  QuickJSExecutionException(
+      std::string reason,
+      int code,
+      ErrorInfo error)
+      : std::runtime_error(
+            error.message.empty() ? reason : error.message),
+        reason_(std::move(reason)),
+        code_(code),
+        error_(std::move(error)) {}
+
+  const std::string& reason() const noexcept { return reason_; }
+  int code() const noexcept { return code_; }
+  const ErrorInfo& error() const noexcept { return error_; }
+
+ private:
+  std::string reason_;
+  int code_ = 1;
+  ErrorInfo error_;
 };
 
 struct MemoryStats {

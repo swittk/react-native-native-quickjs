@@ -440,6 +440,26 @@ rnquickjs::Value invokeOnJSThread(
   return std::move(*invocation->result);
 }
 
+struct WorkerCallbackRegistry {
+  std::vector<std::shared_ptr<jsi::Function>> callbacks;
+  // One owner reference is held by WorkerHostObject until shutdown.
+  // Each queued JS dispatch adds another reference.
+  std::atomic<std::size_t> pendingDispatches{1};
+  std::atomic<bool> shutdown{false};
+};
+
+void finishWorkerCallbackDispatch(WorkerCallbackRegistry* registry) noexcept {
+  if (registry == nullptr) {
+    return;
+  }
+  const auto previous =
+      registry->pendingDispatches.fetch_sub(1, std::memory_order_acq_rel);
+  if (previous == 1 &&
+      registry->shutdown.load(std::memory_order_acquire)) {
+    delete registry;
+  }
+}
+
 rnquickjs::ErrorInfo errorFromJSI(
     jsi::Runtime& runtime,
     const jsi::Value& value) {
@@ -483,11 +503,11 @@ rnquickjs::ErrorInfo errorFromJSI(
 void invokeAsyncOnJSThread(
     jsi::Runtime& runtime,
     const std::shared_ptr<CallInvoker>& callInvoker,
-    const std::shared_ptr<std::atomic<bool>>& dispatchAlive,
-    const std::shared_ptr<jsi::Function>& callback,
+    WorkerCallbackRegistry* registry,
+    jsi::Function* callback,
     const std::vector<rnquickjs::Value>& arguments,
     rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
-  if (!callInvoker) {
+  if (!callInvoker || registry == nullptr || callback == nullptr) {
     rnquickjs::QuickJSContext::AsyncHostResult result;
     result.ok = false;
     result.error.name = "HostError";
@@ -496,18 +516,33 @@ void invokeAsyncOnJSThread(
     return;
   }
 
-  callInvoker->invokeAsync([
-      &runtime,
-      dispatchAlive,
-      callback,
-      arguments,
-      completion = std::move(completion)]() mutable {
-    if (!dispatchAlive ||
-        !dispatchAlive->load(std::memory_order_acquire)) {
-      return;
-    }
+  if (registry->shutdown.load(std::memory_order_acquire)) {
+    rnquickjs::QuickJSContext::AsyncHostResult result;
+    result.ok = false;
+    result.error.name = "HostError";
+    result.error.message = "QuickJS worker is disposed";
+    completion(std::move(result));
+    return;
+  }
 
-    auto settle = std::make_shared<std::atomic<bool>>(false);
+  registry->pendingDispatches.fetch_add(1, std::memory_order_acq_rel);
+  try {
+    callInvoker->invokeAsync([
+        &runtime,
+        registry,
+        callback,
+        arguments,
+        completion = std::move(completion)]() mutable {
+      struct DispatchGuard {
+        WorkerCallbackRegistry* registry;
+        ~DispatchGuard() { finishWorkerCallbackDispatch(registry); }
+      } guard{registry};
+
+      if (registry->shutdown.load(std::memory_order_acquire)) {
+        return;
+      }
+
+      auto settle = std::make_shared<std::atomic<bool>>(false);
     const auto completeOnce =
         [settle, completion](rnquickjs::QuickJSContext::AsyncHostResult result) {
           bool expected = false;
@@ -588,14 +623,18 @@ void invokeAsyncOnJSThread(
       settled.error.name = "HostError";
       settled.error.message = error.what();
       completeOnce(std::move(settled));
-    } catch (...) {
-      rnquickjs::QuickJSContext::AsyncHostResult settled;
-      settled.ok = false;
-      settled.error.name = "HostError";
-      settled.error.message = "Unknown host async callback failure";
-      completeOnce(std::move(settled));
-    }
-  });
+      } catch (...) {
+        rnquickjs::QuickJSContext::AsyncHostResult settled;
+        settled.ok = false;
+        settled.error.name = "HostError";
+        settled.error.message = "Unknown host async callback failure";
+        completeOnce(std::move(settled));
+      }
+    });
+  } catch (...) {
+    finishWorkerCallbackDispatch(registry);
+    throw;
+  }
 }
 
 
@@ -746,6 +785,10 @@ class WorkerHostObject final : public jsi::HostObject,
                 ? context.retainGlobal(source)
                 : context.retainEvaluation(source, filename);
             result.value = rnquickjs::Value{static_cast<double>(handle)};
+          } catch (const rnquickjs::QuickJSExecutionException& error) {
+            result.reason = error.reason();
+            result.code = error.code();
+            result.error = error.error();
           } catch (const std::exception& error) {
             result.reason = "runtime";
             result.code = 1;
@@ -868,32 +911,33 @@ class WorkerHostObject final : public jsi::HostObject,
 
         auto callback = std::make_shared<jsi::Function>(
             args[1].asObject(rt).asFunction(rt));
+        auto* callbackPointer = callback.get();
+        auto* registry = self->callbackRegistry_;
         auto* hostRuntime = &self->hostRuntime_;
         const auto invoker = self->callInvoker_;
-        const auto dispatchAlive = self->callbackDispatchAlive_;
         self->enqueue([
             functionName,
             hostRuntime,
             invoker,
-            dispatchAlive,
-            callback](
+            registry,
+            callbackPointer](
                 rnquickjs::QuickJSRuntime&,
                 rnquickjs::QuickJSContext& context) {
           context.registerAsyncHostFunction(
               functionName,
-              [hostRuntime, invoker, dispatchAlive, callback](
+              [hostRuntime, invoker, registry, callbackPointer](
                   const std::vector<rnquickjs::Value>& values,
                   rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
                 invokeAsyncOnJSThread(
                     *hostRuntime,
                     invoker,
-                    dispatchAlive,
-                    callback,
+                    registry,
+                    callbackPointer,
                     values,
                     std::move(completion));
               });
         });
-        self->callbacks_.push_back(std::move(callback));
+        registry->callbacks.push_back(std::move(callback));
         return jsi::Value::undefined();
       });
     }
@@ -1208,7 +1252,6 @@ class WorkerHostObject final : public jsi::HostObject,
       return;
     }
 
-    callbackDispatchAlive_->store(false, std::memory_order_release);
     cancellationGeneration_.fetch_add(
         1, std::memory_order_acq_rel);
     if (auto* quickjs =
@@ -1226,26 +1269,34 @@ class WorkerHostObject final : public jsi::HostObject,
       worker_.join();
     }
 
-    // Hermes may finalize HostObjects on a GC thread. The worker-side
-    // QuickJS callbacks can release their shared references off-thread, but
-    // keep the final jsi::Function releases on the React Native JS thread.
-    if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
-      // Keep the payload behind a raw pointer so dropping the queued task
-      // during RN teardown leaks it instead of releasing jsi::Function
-      // handles on the wrong thread.
-      auto* callbacks =
-          new std::vector<std::shared_ptr<jsi::Function>>(
-              std::move(callbacks_));
-      try {
-        callInvoker_->invokeAsync([callbacks]() {
-          delete callbacks;
-        });
-      } catch (...) {
-        // The JS executor is already unavailable. Intentionally leak the
-        // callbacks rather than risk cross-thread JSI destruction.
+    // Hermes may finalize HostObjects on a GC thread. Keep all retained
+    // jsi::Function ownership in a heap registry whose final deletion is
+    // guaranteed to happen on the JS thread. If RN drops queued CallInvoker
+    // work during teardown, the registry intentionally leaks rather than
+    // releasing JSI values from the wrong thread.
+    auto* registry = std::exchange(callbackRegistry_, nullptr);
+    if (registry != nullptr) {
+      registry->shutdown.store(true, std::memory_order_release);
+      const auto previous =
+          registry->pendingDispatches.fetch_sub(
+              1, std::memory_order_acq_rel);
+      if (previous == 1) {
+        // No JS dispatch owns the registry. The owner reference is the final
+        // one, so release it only on the JS thread.
+        if (std::this_thread::get_id() == jsThread_) {
+          delete registry;
+        } else if (callInvoker_) {
+          try {
+            callInvoker_->invokeAsync([registry]() {
+              delete registry;
+            });
+          } catch (...) {
+            // JS executor already unavailable: intentionally leak.
+          }
+        }
       }
-    } else {
-      callbacks_.clear();
+      // Otherwise a queued JS dispatch still owns a reference. The final
+      // dispatch to finish will delete the registry on the JS thread.
     }
   }
 
@@ -1259,9 +1310,7 @@ class WorkerHostObject final : public jsi::HostObject,
   std::condition_variable condition_;
   std::deque<Command> commands_;
   std::deque<WorkerTaskResult> results_;
-  std::vector<std::shared_ptr<jsi::Function>> callbacks_;
-  std::shared_ptr<std::atomic<bool>> callbackDispatchAlive_{
-      std::make_shared<std::atomic<bool>>(true)};
+  WorkerCallbackRegistry* callbackRegistry_ = new WorkerCallbackRegistry();
 
   std::atomic<rnquickjs::QuickJSRuntime*> activeRuntime_{nullptr};
   std::atomic<bool> executing_{false};

@@ -11,6 +11,7 @@
 
 using rnquickjs::EvalMode;
 using rnquickjs::QuickJSRuntime;
+using rnquickjs::QuickJSExecutionException;
 using rnquickjs::QuickJSContext;
 using rnquickjs::RuntimeOptions;
 using rnquickjs::Value;
@@ -667,14 +668,22 @@ int main() {
 
     const auto started = std::chrono::steady_clock::now();
     bool threw = false;
+    bool classified = false;
     try {
       (void)context->retainGlobal("slowGlobal");
+    } catch (const QuickJSExecutionException& error) {
+      threw = true;
+      classified =
+          error.reason() == "deadline" && error.code() == 1002;
     } catch (const std::exception&) {
       threw = true;
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
     check(threw, "retainGlobal interrupts guest getter");
+    check(
+        classified,
+        "retainGlobal preserves deadline classification");
     check(
         elapsed.count() < 200,
         "retainGlobal guest getter remains inside execution deadline");
@@ -688,16 +697,24 @@ int main() {
 
     const auto started = std::chrono::steady_clock::now();
     bool threw = false;
+    bool classified = false;
     try {
       (void)context->retainEvaluation(
           "throw { toString() { for (;;) {} } }",
           "retain-error-stringify.js");
+    } catch (const QuickJSExecutionException& error) {
+      threw = true;
+      classified =
+          error.reason() == "deadline" && error.code() == 1002;
     } catch (const std::exception&) {
       threw = true;
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
     check(threw, "retainEvaluation reports thrown guest value");
+    check(
+        classified,
+        "retainEvaluation preserves deadline classification");
     check(
         elapsed.count() < 200,
         "retainEvaluation exception stringification remains deadline-bounded");
@@ -825,6 +842,60 @@ int main() {
           array.size() == 2 && number(array[0]) == 1 && number(array[1]) == 2;
     }
     check(valuesOk, "concurrent async host Promises preserve Promise.all ordering");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    context->registerAsyncHostFunction(
+        "outerObjectReentrant",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion complete) {
+          QuickJSContext::AsyncHostResult result;
+          Value::Object value;
+          value["answer"] = Value{42};
+          result.value = Value{std::move(value)};
+          complete(std::move(result));
+        });
+    context->registerAsyncHostFunction(
+        "neverNestedReentrant",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {});
+    context->registerHostFunction(
+        "nestedPendingClear",
+        [&context](const std::vector<Value>&) -> Value {
+          auto nested = context->evaluate(
+              "await neverNestedReentrant();",
+              "nested-pending-clear.js",
+              EvalMode::AsyncScript);
+          return Value{nested.reason};
+        });
+
+    auto reentrant = context->evaluateAwaited(
+        "Object.defineProperty(Object.prototype, 'then', {"
+        "  configurable: true,"
+        "  get() {"
+        "    delete Object.prototype.then;"
+        "    globalThis.nestedClearReason = nestedPendingClear();"
+        "    return undefined;"
+        "  }"
+        "});"
+        "const value = await outerObjectReentrant();"
+        "globalThis.reentrantOuterAnswer = value.answer;",
+        "async-completion-reentrant-clear.js",
+        EvalMode::AsyncScript);
+    check(
+        reentrant.ok(),
+        "async completion survives reentrant pending-resolver clearing");
+    auto reentrantState = context->evaluate(
+        "({ answer: globalThis.reentrantOuterAnswer,"
+        "   reason: globalThis.nestedClearReason })",
+        "async-completion-reentrant-check.js");
+    check(
+        reentrantState.ok() && reentrantState.value.has_value() &&
+            number(object(*reentrantState.value).at("answer")) == 42 &&
+            std::get<std::string>(
+                object(*reentrantState.value).at("reason").data) ==
+                "pending-promise",
+        "reentrant nested pending evaluation cannot invalidate outer resolver");
   }
 
   {
@@ -1104,6 +1175,20 @@ int main() {
     check(
         value.ok() && value.value.has_value() && number(*value.value) == 42,
         "module side effect visible");
+
+    auto asyncModule = context->evaluateAwaited(
+        "import { answer } from 'math';"
+        "await Promise.resolve();"
+        "globalThis.asyncModuleAnswer = answer + 1;",
+        "async-entry.mjs",
+        EvalMode::AsyncModule);
+    check(asyncModule.ok(), "async module with top-level await settles");
+    auto asyncValue =
+        context->evaluate("asyncModuleAnswer", "async-module-check.js");
+    check(
+        asyncValue.ok() && asyncValue.value.has_value() &&
+            number(*asyncValue.value) == 43,
+        "async module side effect visible after top-level await");
 
     auto denied = context->evaluate(
         "import value from 'not-granted'; globalThis.nope = value;",

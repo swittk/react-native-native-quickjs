@@ -657,6 +657,7 @@ class WorkerHostObject final : public jsi::HostObject,
       : hostRuntime_(hostRuntime),
         callInvoker_(std::move(callInvoker)),
         options_(options) {
+    auto callbackRegistry = std::make_unique<WorkerCallbackRegistry>();
     worker_ = std::thread([this] { workerMain(); });
     std::unique_lock<std::mutex> lock(mutex_);
     condition_.wait(lock, [this] { return ready_; });
@@ -667,7 +668,7 @@ class WorkerHostObject final : public jsi::HostObject,
       }
       throw std::runtime_error(startupError_);
     }
-    callbackRegistry_ = new WorkerCallbackRegistry();
+    callbackRegistry_ = callbackRegistry.release();
   }
 
   ~WorkerHostObject() override {

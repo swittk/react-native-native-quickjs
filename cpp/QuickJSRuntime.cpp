@@ -7,6 +7,10 @@
 #include <stdexcept>
 #include <utility>
 
+#if defined(__APPLE__) || defined(__ANDROID__) || defined(__linux__)
+#include <pthread.h>
+#endif
+
 namespace rnquickjs {
 namespace {
 
@@ -14,6 +18,7 @@ constexpr std::size_t kMinMemoryLimit = 512 * 1024;
 constexpr std::size_t kMaxMemoryLimit = 512 * 1024 * 1024;
 constexpr std::size_t kMinStackSize = 64 * 1024;
 constexpr std::size_t kMaxStackSize = 32 * 1024 * 1024;
+constexpr std::size_t kNativeStackHeadroom = 128 * 1024;
 constexpr std::int64_t kMaxExecutionLimitMs = 5 * 60 * 1000;
 constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
 constexpr std::size_t kMaxOutputLines = 10'000;
@@ -28,6 +33,73 @@ std::int64_t nowNs() noexcept {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+std::size_t currentThreadAvailableStackBytes() noexcept {
+#if defined(__APPLE__)
+  const auto thread = pthread_self();
+  const auto stackSize = pthread_get_stacksize_np(thread);
+  const auto stackTop =
+      reinterpret_cast<std::uintptr_t>(pthread_get_stackaddr_np(thread));
+  const std::uintptr_t marker =
+      reinterpret_cast<std::uintptr_t>(&thread);
+  if (stackSize == 0 || stackTop < stackSize) {
+    return 0;
+  }
+  const auto stackBottom = stackTop - stackSize;
+  if (marker <= stackBottom || marker > stackTop) {
+    return stackSize;
+  }
+  return marker - stackBottom;
+#elif defined(__ANDROID__) || defined(__linux__)
+  pthread_attr_t attributes;
+  if (pthread_getattr_np(pthread_self(), &attributes) != 0) {
+    return 0;
+  }
+  void* stackAddress = nullptr;
+  std::size_t stackSize = 0;
+  const int status =
+      pthread_attr_getstack(&attributes, &stackAddress, &stackSize);
+  pthread_attr_destroy(&attributes);
+  if (status != 0 || stackAddress == nullptr || stackSize == 0) {
+    return 0;
+  }
+  const auto stackBottom =
+      reinterpret_cast<std::uintptr_t>(stackAddress);
+  const auto stackTop = stackBottom + stackSize;
+  const std::uintptr_t marker =
+      reinterpret_cast<std::uintptr_t>(&attributes);
+  if (marker <= stackBottom || marker > stackTop) {
+    return stackSize;
+  }
+  return marker - stackBottom;
+#else
+  return 0;
+#endif
+}
+
+std::size_t quickJSStackCeilingForCurrentThread() noexcept {
+  const auto available = currentThreadAvailableStackBytes();
+  if (available == 0) {
+    return 0;
+  }
+
+  // QuickJS measures its logical stack from the stack pointer captured when
+  // the runtime is constructed. Reserve native host frames and never allow a
+  // later setter to exceed this construction-time ceiling.
+  return available > kNativeStackHeadroom + kMinStackSize
+      ? available - kNativeStackHeadroom
+      : std::max<std::size_t>(available / 2, 16 * 1024);
+}
+
+std::size_t clampQuickJSStackBytes(
+    std::size_t requested,
+    std::size_t nativeCeiling) noexcept {
+  requested =
+      std::clamp<std::size_t>(requested, kMinStackSize, kMaxStackSize);
+  return nativeCeiling == 0
+      ? requested
+      : std::min(requested, nativeCeiling);
 }
 
 void discardException(JSContext* context) noexcept {
@@ -146,6 +218,7 @@ int evalFlags(EvalMode mode) noexcept {
 } // namespace
 
 QuickJSRuntime::QuickJSRuntime(RuntimeOptions options) : options_(options) {
+  maxSafeStackBytes_ = quickJSStackCeilingForCurrentThread();
   options_.executionLimitMs = options_.executionLimitMs <= 0
       ? 0
       : std::min<std::int64_t>(
@@ -153,7 +226,7 @@ QuickJSRuntime::QuickJSRuntime(RuntimeOptions options) : options_(options) {
   options_.memoryLimitBytes =
       std::clamp<std::size_t>(options_.memoryLimitBytes, kMinMemoryLimit, kMaxMemoryLimit);
   options_.maxStackBytes =
-      std::clamp<std::size_t>(options_.maxStackBytes, kMinStackSize, kMaxStackSize);
+      clampQuickJSStackBytes(options_.maxStackBytes, maxSafeStackBytes_);
   options_.maxOutputBytes =
       std::min(options_.maxOutputBytes, kMaxOutputBytes);
   options_.maxOutputLines =
@@ -253,7 +326,7 @@ std::size_t QuickJSRuntime::memoryLimitBytes() const noexcept {
 
 void QuickJSRuntime::setMaxStackBytes(std::size_t value) noexcept {
   options_.maxStackBytes =
-      std::clamp<std::size_t>(value, kMinStackSize, kMaxStackSize);
+      clampQuickJSStackBytes(value, maxSafeStackBytes_);
   if (runtime_ != nullptr) {
     JS_SetMaxStackSize(runtime_, options_.maxStackBytes);
   }
@@ -1069,6 +1142,7 @@ ExecutionResult QuickJSContext::executePendingJobs(std::size_t maxJobs) {
     result.error.message = "QuickJS context is disposed";
     return result;
   }
+  ContextPin pin(*this);
 
   processAsyncCompletions();
   if (auto failure = takeAsyncCompletionFailure()) {

@@ -913,38 +913,48 @@ class WorkerHostObject final : public jsi::HostObject,
 
         auto callback = std::make_shared<jsi::Function>(
             args[1].asObject(rt).asFunction(rt));
-        auto* registry = self->callbackRegistry_;
-        registry->callbacks.push_back(callback);
-        auto* callbackPointer = callback.get();
         auto* hostRuntime = &self->hostRuntime_;
         const auto invoker = self->callInvoker_;
-        try {
-          self->enqueue([
-              functionName,
-              hostRuntime,
-              invoker,
-              registry,
-              callbackPointer](
-                  rnquickjs::QuickJSRuntime&,
-                  rnquickjs::QuickJSContext& context) {
-            context.registerAsyncHostFunction(
+        {
+          std::lock_guard<std::mutex> lock(self->mutex_);
+          if (self->stopping_ ||
+              self->disposed_.load(std::memory_order_acquire) ||
+              self->callbackRegistry_ == nullptr) {
+            throw jsi::JSError(rt, "QuickJS worker is disposed");
+          }
+
+          auto* registry = self->callbackRegistry_;
+          registry->callbacks.push_back(callback);
+          auto* callbackPointer = callback.get();
+          try {
+            self->commands_.push_back([
                 functionName,
-                [hostRuntime, invoker, registry, callbackPointer](
-                    const std::vector<rnquickjs::Value>& values,
-                    rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
-                  invokeAsyncOnJSThread(
-                      *hostRuntime,
-                      invoker,
-                      registry,
-                      callbackPointer,
-                      values,
-                      std::move(completion));
-                });
-          });
-        } catch (...) {
-          registry->callbacks.pop_back();
-          throw;
+                hostRuntime,
+                invoker,
+                registry,
+                callbackPointer](
+                    rnquickjs::QuickJSRuntime&,
+                    rnquickjs::QuickJSContext& context) {
+              context.registerAsyncHostFunction(
+                  functionName,
+                  [hostRuntime, invoker, registry, callbackPointer](
+                      const std::vector<rnquickjs::Value>& values,
+                      rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
+                    invokeAsyncOnJSThread(
+                        *hostRuntime,
+                        invoker,
+                        registry,
+                        callbackPointer,
+                        values,
+                        std::move(completion));
+                  });
+            });
+          } catch (...) {
+            registry->callbacks.pop_back();
+            throw;
+          }
         }
+        self->condition_.notify_one();
         return jsi::Value::undefined();
       });
     }
@@ -1259,13 +1269,6 @@ class WorkerHostObject final : public jsi::HostObject,
       return;
     }
 
-    // Prevent already-queued JS callback dispatches from entering host code
-    // as soon as disposal begins. The registry owner sentinel remains held
-    // until after the worker thread joins, so this cannot free the registry.
-    if (callbackRegistry_ != nullptr) {
-      callbackRegistry_->shutdown.store(true, std::memory_order_release);
-    }
-
     cancellationGeneration_.fetch_add(
         1, std::memory_order_acq_rel);
     if (auto* quickjs =
@@ -1275,6 +1278,11 @@ class WorkerHostObject final : public jsi::HostObject,
     {
       std::lock_guard<std::mutex> lock(mutex_);
       stopping_ = true;
+      // Serialize registry shutdown with callback registration so a JS call
+      // racing finalization cannot observe or retain a freed registry.
+      if (callbackRegistry_ != nullptr) {
+        callbackRegistry_->shutdown.store(true, std::memory_order_release);
+      }
       commands_.clear();
     }
     condition_.notify_all();

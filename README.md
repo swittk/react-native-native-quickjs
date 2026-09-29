@@ -138,7 +138,7 @@ Runtime options include:
 - optional execution deadline per active JavaScript turn (`0`/omitted means
   unlimited, which is the intentional default);
 - memory limit;
-- maximum stack size;
+- maximum stack size (treated as an upper bound and clamped below the actual native thread stack with host-frame headroom);
 - bounded console output.
 
 Automatic execution deadlines are **opt-in**. The library intentionally does
@@ -178,6 +178,11 @@ factories:
 - `SKRNNativeQuickJSCreateWorker`
 
 Both use the same vendored QuickJS core.
+
+React Native 0.73.6 support covers its legacy architecture and its normal New
+Architecture bridge path. RN 0.73's separately gated experimental
+`enableBridgelessArchitecture` mode does not expose a public JavaScript runtime
+holder and is not part of the 0.73 compatibility matrix.
 
 The example remains on React Native 0.73.6 with Hermes and demonstrates both the
 synchronous embedding surface and the worker/await/hard-cancel surface.

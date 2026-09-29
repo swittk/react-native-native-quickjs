@@ -723,6 +723,63 @@ int main() {
   {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
+    QuickJSContext::AsyncHostCompletion completeLater;
+    bool settledJobRan = false;
+
+    context->registerAsyncHostFunction(
+        "lateObjectForPendingJobs",
+        [&completeLater](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          completeLater = std::move(complete);
+        });
+    context->registerHostFunction(
+        "disposeDuringResolution",
+        [&context](const std::vector<Value>&) -> Value {
+          context->dispose();
+          return Value{true};
+        });
+    context->registerHostFunction(
+        "markPendingJobRan",
+        [&settledJobRan](const std::vector<Value>&) -> Value {
+          settledJobRan = true;
+          return Value{true};
+        });
+
+    auto setup = context->evaluate(
+        "Object.defineProperty(Object.prototype, 'then', {"
+        "  configurable: true,"
+        "  get() {"
+        "    delete Object.prototype.then;"
+        "    disposeDuringResolution();"
+        "    return undefined;"
+        "  }"
+        "});"
+        "lateObjectForPendingJobs().then(() => markPendingJobRan());"
+        "void 0;",
+        "pending-jobs-dispose-setup.js");
+    check(
+        setup.ok() && static_cast<bool>(completeLater),
+        "pending-jobs disposal regression setup succeeds");
+
+    QuickJSContext::AsyncHostResult completion;
+    Value::Object payload;
+    payload["answer"] = Value{42};
+    completion.value = Value{std::move(payload)};
+    completeLater(std::move(completion));
+
+    auto jobs = context->executePendingJobs();
+    check(
+        jobs.ok() && settledJobRan,
+        "executePendingJobs stays pinned through completion and queued jobs");
+    check(
+        !context->isOpen(),
+        "executePendingJobs releases deferred disposal only after the call");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
     context->registerHostFunction(
         "attemptDispose",
         [&runtime, &context](const std::vector<Value>&) -> Value {
@@ -1144,6 +1201,19 @@ int main() {
     check(
         recovered.ok() && recovered.value.has_value() && number(*recovered.value) == 42,
         "runtime reusable after cancellation reset");
+  }
+
+  {
+    RuntimeOptions options;
+    options.maxStackBytes = 32 * 1024 * 1024;
+    QuickJSRuntime runtime(options);
+    check(
+        runtime.maxStackBytes() < 32 * 1024 * 1024,
+        "QuickJS stack limit is clamped below the native thread stack");
+    runtime.setMaxStackBytes(32 * 1024 * 1024);
+    check(
+        runtime.maxStackBytes() < 32 * 1024 * 1024,
+        "later QuickJS stack-limit updates remain native-stack bounded");
   }
 
   {

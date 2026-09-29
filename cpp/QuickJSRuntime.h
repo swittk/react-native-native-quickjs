@@ -367,6 +367,7 @@ class QuickJSRuntime final {
   void flushDeferredContextDisposals() noexcept;
 
   RuntimeOptions options_;
+  std::size_t maxSafeStackBytes_ = 0;
   JSRuntime* runtime_ = nullptr;
   std::atomic<bool> cancellationRequested_{false};
   std::atomic<std::int64_t> deadlineNs_{0};

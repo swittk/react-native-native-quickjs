@@ -9,6 +9,10 @@
 #include <variant>
 #include <vector>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 using rnquickjs::EvalMode;
 using rnquickjs::QuickJSRuntime;
 using rnquickjs::QuickJSExecutionException;
@@ -35,6 +39,36 @@ double number(const Value& value) {
 const Value::Object& object(const Value& value) {
   return std::get<Value::Object>(value.data);
 }
+
+#if defined(__linux__)
+struct SmallStackResult {
+  bool runtimeCreated = false;
+  bool stackWasClamped = false;
+  bool recursionWasCaught = false;
+};
+
+void* runQuickJSOnSmallNativeStack(void* opaque) {
+  auto* result = static_cast<SmallStackResult*>(opaque);
+  try {
+    RuntimeOptions options;
+    options.maxStackBytes = 32 * 1024 * 1024;
+    QuickJSRuntime runtime(options);
+    result->runtimeCreated = true;
+    result->stackWasClamped = runtime.maxStackBytes() < 512 * 1024;
+
+    auto context = runtime.createContext();
+    auto recursion = context->evaluate(
+        "function recurse() { return 1 + recurse(); } recurse();",
+        "small-native-stack-recursion.js");
+    result->recursionWasCaught =
+        !recursion.ok() &&
+        recursion.error.message.find("stack") != std::string::npos;
+  } catch (...) {
+    result->recursionWasCaught = false;
+  }
+  return nullptr;
+}
+#endif
 }  // namespace
 
 int main() {
@@ -1215,6 +1249,40 @@ int main() {
         runtime.maxStackBytes() < 32 * 1024 * 1024,
         "later QuickJS stack-limit updates remain native-stack bounded");
   }
+
+#if defined(__linux__)
+  {
+    pthread_attr_t attributes;
+    SmallStackResult smallStack;
+    pthread_t thread{};
+    const bool attributesReady = pthread_attr_init(&attributes) == 0;
+    const bool stackConfigured =
+        attributesReady &&
+        pthread_attr_setstacksize(&attributes, 512 * 1024) == 0;
+    const bool threadStarted =
+        stackConfigured &&
+        pthread_create(
+            &thread,
+            &attributes,
+            &runQuickJSOnSmallNativeStack,
+            &smallStack) == 0;
+    if (attributesReady) {
+      pthread_attr_destroy(&attributes);
+    }
+    if (threadStarted) {
+      pthread_join(thread, nullptr);
+    }
+    check(
+        threadStarted && smallStack.runtimeCreated,
+        "QuickJS runtime starts on a 512 KiB native thread stack");
+    check(
+        threadStarted && smallStack.stackWasClamped,
+        "QuickJS logical stack stays below a 512 KiB native stack");
+    check(
+        threadStarted && smallStack.recursionWasCaught,
+        "deep guest recursion is caught before native stack exhaustion");
+  }
+#endif
 
   {
     RuntimeOptions options;

@@ -667,6 +667,7 @@ class WorkerHostObject final : public jsi::HostObject,
       }
       throw std::runtime_error(startupError_);
     }
+    callbackRegistry_ = new WorkerCallbackRegistry();
   }
 
   ~WorkerHostObject() override {
@@ -1252,6 +1253,13 @@ class WorkerHostObject final : public jsi::HostObject,
       return;
     }
 
+    // Prevent already-queued JS callback dispatches from entering host code
+    // as soon as disposal begins. The registry owner sentinel remains held
+    // until after the worker thread joins, so this cannot free the registry.
+    if (callbackRegistry_ != nullptr) {
+      callbackRegistry_->shutdown.store(true, std::memory_order_release);
+    }
+
     cancellationGeneration_.fetch_add(
         1, std::memory_order_acq_rel);
     if (auto* quickjs =
@@ -1269,6 +1277,12 @@ class WorkerHostObject final : public jsi::HostObject,
       worker_.join();
     }
 
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      results_.clear();
+    }
+    outstandingTasks_.store(0, std::memory_order_release);
+
     // Hermes may finalize HostObjects on a GC thread. Keep all retained
     // jsi::Function ownership in a heap registry whose final deletion is
     // guaranteed to happen on the JS thread. If RN drops queued CallInvoker
@@ -1276,7 +1290,6 @@ class WorkerHostObject final : public jsi::HostObject,
     // releasing JSI values from the wrong thread.
     auto* registry = std::exchange(callbackRegistry_, nullptr);
     if (registry != nullptr) {
-      registry->shutdown.store(true, std::memory_order_release);
       const auto previous =
           registry->pendingDispatches.fetch_sub(
               1, std::memory_order_acq_rel);
@@ -1310,7 +1323,7 @@ class WorkerHostObject final : public jsi::HostObject,
   std::condition_variable condition_;
   std::deque<Command> commands_;
   std::deque<WorkerTaskResult> results_;
-  WorkerCallbackRegistry* callbackRegistry_ = new WorkerCallbackRegistry();
+  WorkerCallbackRegistry* callbackRegistry_ = nullptr;
 
   std::atomic<rnquickjs::QuickJSRuntime*> activeRuntime_{nullptr};
   std::atomic<bool> executing_{false};

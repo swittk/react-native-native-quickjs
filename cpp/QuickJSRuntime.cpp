@@ -19,6 +19,8 @@ constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
 constexpr std::size_t kMaxOutputLines = 10'000;
 constexpr std::size_t kMaxUnhandledRejections = 64;
 constexpr std::size_t kMaxUnhandledRejectionFieldBytes = 4 * 1024;
+constexpr std::size_t kMaxErrorFieldBytes = 64 * 1024;
+constexpr std::size_t kMaxPendingAsyncHostCalls = 1024;
 constexpr int kMaxValueDepth = 32;
 constexpr std::size_t kMaxValueNodes = 16'384;
 
@@ -36,14 +38,18 @@ void discardException(JSContext* context) noexcept {
   JS_FreeValue(context, exception);
 }
 
-std::string bestEffortToString(JSContext* context, JSValueConst value) {
+std::string bestEffortToString(
+    JSContext* context,
+    JSValueConst value,
+    std::size_t maxBytes = kMaxErrorFieldBytes) {
   size_t length = 0;
   const char* text = JS_ToCStringLen(context, &length, value);
   if (text == nullptr) {
     discardException(context);
     return {};
   }
-  std::string result(text, length);
+  const std::size_t copyLength = std::min(length, maxBytes);
+  std::string result(text, copyLength);
   JS_FreeCString(context, text);
   return result;
 }
@@ -51,7 +57,8 @@ std::string bestEffortToString(JSContext* context, JSValueConst value) {
 std::string stringProperty(
     JSContext* context,
     JSValueConst object,
-    const char* name) {
+    const char* name,
+    std::size_t maxBytes = kMaxErrorFieldBytes) {
   JSValue value = JS_GetPropertyStr(context, object, name);
   if (JS_IsException(value)) {
     discardException(context);
@@ -59,7 +66,7 @@ std::string stringProperty(
   }
   std::string result;
   if (!JS_IsUndefined(value) && !JS_IsNull(value)) {
-    result = bestEffortToString(context, value);
+    result = bestEffortToString(context, value, maxBytes);
   }
   JS_FreeValue(context, value);
   return result;
@@ -542,7 +549,71 @@ QuickJSContext::QuickJSContext(QuickJSRuntime& runtime)
   }
   promiseThen_ = thenFunction;
 
-  installConsole();
+  JSValue plainObject = JS_NewObject(context_);
+  if (JS_IsException(plainObject)) {
+    const ErrorInfo error = takeExceptionInfo();
+    JS_FreeValue(context_, promiseThen_);
+    promiseThen_ = JS_UNDEFINED;
+    JS_SetContextOpaque(context_, nullptr);
+    JS_FreeContext(context_);
+    context_ = nullptr;
+    throw std::runtime_error(
+        error.message.empty()
+            ? "Unable to capture QuickJS Object prototype"
+            : error.message);
+  }
+  objectClassId_ = JS_GetClassID(plainObject);
+  JSValue objectPrototype = JS_GetPrototype(context_, plainObject);
+  JS_FreeValue(context_, plainObject);
+  if (JS_IsException(objectPrototype) || !JS_IsObject(objectPrototype)) {
+    ErrorInfo error;
+    if (JS_IsException(objectPrototype)) {
+      error = takeExceptionInfo();
+    } else {
+      JS_FreeValue(context_, objectPrototype);
+    }
+    JS_FreeValue(context_, promiseThen_);
+    promiseThen_ = JS_UNDEFINED;
+    JS_SetContextOpaque(context_, nullptr);
+    JS_FreeContext(context_);
+    context_ = nullptr;
+    throw std::runtime_error(
+        error.message.empty()
+            ? "Unable to capture QuickJS Object prototype"
+            : error.message);
+  }
+  objectPrototype_ = objectPrototype;
+
+  JSValue plainArray = JS_NewArray(context_);
+  if (JS_IsException(plainArray)) {
+    const ErrorInfo error = takeExceptionInfo();
+    JS_FreeValue(context_, objectPrototype_);
+    objectPrototype_ = JS_UNDEFINED;
+    JS_FreeValue(context_, promiseThen_);
+    promiseThen_ = JS_UNDEFINED;
+    JS_SetContextOpaque(context_, nullptr);
+    JS_FreeContext(context_);
+    context_ = nullptr;
+    throw std::runtime_error(
+        error.message.empty()
+            ? "Unable to capture QuickJS Array class"
+            : error.message);
+  }
+  arrayClassId_ = JS_GetClassID(plainArray);
+  JS_FreeValue(context_, plainArray);
+
+  try {
+    installConsole();
+  } catch (...) {
+    JS_FreeValue(context_, objectPrototype_);
+    objectPrototype_ = JS_UNDEFINED;
+    JS_FreeValue(context_, promiseThen_);
+    promiseThen_ = JS_UNDEFINED;
+    JS_SetContextOpaque(context_, nullptr);
+    JS_FreeContext(context_);
+    context_ = nullptr;
+    throw;
+  }
 }
 
 QuickJSContext::~QuickJSContext() {
@@ -1238,7 +1309,9 @@ std::string QuickJSContext::takeOutput(std::size_t count) {
       result.push_back('\n');
     }
     result.append(output_.front());
-    outputBytes_ -= output_.front().size();
+    const std::size_t serializedBytes =
+        output_.front().size() + (output_.size() > 1 ? 1 : 0);
+    outputBytes_ -= serializedBytes;
     output_.pop_front();
   }
   return result;
@@ -1286,6 +1359,10 @@ void QuickJSContext::dispose() noexcept {
     JS_FreeValue(context_, promiseThen_);
     promiseThen_ = JS_UNDEFINED;
   }
+  if (!JS_IsUndefined(objectPrototype_)) {
+    JS_FreeValue(context_, objectPrototype_);
+    objectPrototype_ = JS_UNDEFINED;
+  }
 
   runtime_.clearUnhandledRejectionsForContext(context_);
   JS_SetContextOpaque(context_, nullptr);
@@ -1329,15 +1406,20 @@ JSValue QuickJSContext::hostFunctionThunk(
     return JS_ThrowReferenceError(context, "Unknown host function");
   }
 
+  std::vector<Value> args;
   try {
-    std::vector<Value> args;
     args.reserve(static_cast<std::size_t>(std::max(argc, 0)));
     std::size_t nodes = 0;
     for (int index = 0; index < argc; ++index) {
       args.push_back(self->fromJSValue(argv[index], 0, &nodes));
     }
+  } catch (const std::exception& error) {
+    return JS_ThrowTypeError(context, "%s", error.what());
+  }
+
+  try {
     const Value result = found->second(args);
-    nodes = 0;
+    std::size_t nodes = 0;
     return self->toJSValue(result, 0, &nodes);
   } catch (const std::exception& error) {
     return JS_ThrowInternalError(context, "%s", error.what());
@@ -1381,6 +1463,11 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
     return JS_ThrowTypeError(context, "%s", error.what());
   }
 
+  if (self->pendingPromises_.size() >= kMaxPendingAsyncHostCalls) {
+    return JS_ThrowRangeError(
+        context, "Too many pending async host calls");
+  }
+
   JSValue resolving[2] = {JS_UNDEFINED, JS_UNDEFINED};
   JSValue promise = JS_NewPromiseCapability(context, resolving);
   if (JS_IsException(promise)) {
@@ -1393,7 +1480,15 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
       PendingPromise{resolving[0], resolving[1]});
 
   const std::weak_ptr<AsyncState> weakState = self->asyncState_;
-  auto complete = [weakState, requestId](AsyncHostResult result) {
+  const auto completionClaimed =
+      std::make_shared<std::atomic<bool>>(false);
+  auto complete = [weakState, requestId, completionClaimed](
+                      AsyncHostResult result) {
+    bool expected = false;
+    if (!completionClaimed->compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+      return;
+    }
     const auto state = weakState.lock();
     if (!state || !state->alive.load(std::memory_order_relaxed)) {
       return;
@@ -1844,7 +1939,9 @@ Value QuickJSContext::fromJSValue(
     return result;
   }
 
-  if (JS_IsArray(context_, value)) {
+  if (JS_IsObject(value) &&
+      arrayClassId_ != 0 &&
+      JS_GetClassID(value) == arrayClassId_) {
     JSValue lengthValue = JS_GetPropertyStr(context_, value, "length");
     uint32_t length = 0;
     if (JS_ToUint32(context_, &length, lengthValue) < 0) {
@@ -1875,6 +1972,28 @@ Value QuickJSContext::fromJSValue(
   }
 
   if (JS_IsObject(value)) {
+    if (JS_IsFunction(context_, value) ||
+        objectClassId_ == 0 ||
+        JS_GetClassID(value) != objectClassId_) {
+      throw std::runtime_error(
+          "Only plain objects can cross the QuickJS bridge");
+    }
+
+    JSValue prototype = JS_GetPrototype(context_, value);
+    if (JS_IsException(prototype)) {
+      throw std::runtime_error(
+          "Unable to inspect QuickJS object prototype");
+    }
+    const bool isPlain =
+        JS_IsNull(prototype) ||
+        (!JS_IsUndefined(objectPrototype_) &&
+         JS_StrictEq(context_, prototype, objectPrototype_));
+    JS_FreeValue(context_, prototype);
+    if (!isPlain) {
+      throw std::runtime_error(
+          "Only plain objects can cross the QuickJS bridge");
+    }
+
     JSPropertyEnum* properties = nullptr;
     uint32_t count = 0;
     if (JS_GetOwnPropertyNames(
@@ -1986,12 +2105,50 @@ JSValue QuickJSContext::toJSValue(
 
 void QuickJSContext::installConsole() {
   JSValue console = JS_NewObject(context_);
+  if (JS_IsException(console)) {
+    const ErrorInfo error = takeExceptionInfo();
+    throw std::runtime_error(
+        error.message.empty() ? "Unable to create QuickJS console" : error.message);
+  }
+
   JSValue log = JS_NewCFunction(
       context_, &QuickJSContext::consoleLogThunk, "log", 1);
-  JS_SetPropertyStr(context_, console, "log", log);
+  if (JS_IsException(log)) {
+    JS_FreeValue(context_, console);
+    const ErrorInfo error = takeExceptionInfo();
+    throw std::runtime_error(
+        error.message.empty()
+            ? "Unable to create QuickJS console.log"
+            : error.message);
+  }
+  if (JS_DefinePropertyValueStr(
+          context_,
+          console,
+          "log",
+          log,
+          JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+    JS_FreeValue(context_, console);
+    const ErrorInfo error = takeExceptionInfo();
+    throw std::runtime_error(
+        error.message.empty()
+            ? "Unable to install QuickJS console.log"
+            : error.message);
+  }
 
   JSValue global = JS_GetGlobalObject(context_);
-  JS_SetPropertyStr(context_, global, "console", console);
+  if (JS_DefinePropertyValueStr(
+          context_,
+          global,
+          "console",
+          console,
+          JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+    JS_FreeValue(context_, global);
+    const ErrorInfo error = takeExceptionInfo();
+    throw std::runtime_error(
+        error.message.empty()
+            ? "Unable to install QuickJS console"
+            : error.message);
+  }
   JS_FreeValue(context_, global);
 }
 
@@ -2005,11 +2162,20 @@ void QuickJSContext::appendOutput(std::string line) {
     return;
   }
 
-  if (line.size() > byteLimit - outputBytes_) {
-    line.resize(byteLimit - outputBytes_);
+  // getOutput()/takeOutput() serialize stored lines with a newline between
+  // them, so separators must count against the byte budget as well.
+  const std::size_t separatorBytes = output_.empty() ? 0 : 1;
+  const std::size_t remaining = byteLimit - outputBytes_;
+  if (separatorBytes > remaining) {
+    outputTruncated_.store(true, std::memory_order_relaxed);
+    return;
+  }
+  const std::size_t lineBudget = remaining - separatorBytes;
+  if (line.size() > lineBudget) {
+    line.resize(lineBudget);
     outputTruncated_.store(true, std::memory_order_relaxed);
   }
-  outputBytes_ += line.size();
+  outputBytes_ += separatorBytes + line.size();
   output_.push_back(std::move(line));
 }
 

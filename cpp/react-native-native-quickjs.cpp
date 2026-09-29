@@ -132,11 +132,30 @@ rnquickjs::Value fromJSI(jsi::Runtime& runtime, const jsi::Value& value) {
   return fromJSI(runtime, value, 0, nodes);
 }
 
+void defineOwnDataProperty(
+    jsi::Runtime& runtime,
+    jsi::Function& defineProperty,
+    jsi::Object& target,
+    const std::string& key,
+    jsi::Value value) {
+  jsi::Object descriptor(runtime);
+  descriptor.setProperty(runtime, "value", std::move(value));
+  descriptor.setProperty(runtime, "writable", true);
+  descriptor.setProperty(runtime, "enumerable", true);
+  descriptor.setProperty(runtime, "configurable", true);
+  defineProperty.call(
+      runtime,
+      target,
+      jsi::String::createFromUtf8(runtime, key),
+      descriptor);
+}
+
 jsi::Value toJSI(
     jsi::Runtime& runtime,
     const rnquickjs::Value& value,
     int depth,
-    std::size_t& nodes) {
+    std::size_t& nodes,
+    jsi::Function* defineProperty) {
   countNode(depth, nodes);
   if (std::holds_alternative<std::monostate>(value.data)) {
     return jsi::Value::undefined();
@@ -153,43 +172,48 @@ jsi::Value toJSI(
   if (const auto* string = std::get_if<std::string>(&value.data)) {
     return jsi::String::createFromUtf8(runtime, *string);
   }
+  std::optional<jsi::Function> ownedDefineProperty;
+  if (defineProperty == nullptr) {
+    ownedDefineProperty.emplace(
+        runtime.global()
+            .getPropertyAsObject(runtime, "Object")
+            .getPropertyAsFunction(runtime, "defineProperty"));
+    defineProperty = &*ownedDefineProperty;
+  }
+
   if (const auto* values = std::get_if<rnquickjs::Value::Array>(&value.data)) {
     jsi::Array result(runtime, values->size());
     for (std::size_t index = 0; index < values->size(); ++index) {
-      result.setValueAtIndex(
-          runtime, index, toJSI(runtime, (*values)[index], depth + 1, nodes));
+      defineOwnDataProperty(
+          runtime,
+          *defineProperty,
+          result,
+          std::to_string(index),
+          toJSI(
+              runtime,
+              (*values)[index],
+              depth + 1,
+              nodes,
+              defineProperty));
     }
     return result;
   }
 
   jsi::Object result(runtime);
   for (const auto& [key, item] : std::get<rnquickjs::Value::Object>(value.data)) {
-    auto converted = toJSI(runtime, item, depth + 1, nodes);
-    if (key != "__proto__") {
-      result.setProperty(runtime, key.c_str(), std::move(converted));
-      continue;
-    }
-
-    auto defineProperty = runtime.global()
-        .getPropertyAsObject(runtime, "Object")
-        .getPropertyAsFunction(runtime, "defineProperty");
-    jsi::Object descriptor(runtime);
-    descriptor.setProperty(runtime, "value", std::move(converted));
-    descriptor.setProperty(runtime, "writable", true);
-    descriptor.setProperty(runtime, "enumerable", true);
-    descriptor.setProperty(runtime, "configurable", true);
-    defineProperty.call(
+    defineOwnDataProperty(
         runtime,
+        *defineProperty,
         result,
-        jsi::String::createFromUtf8(runtime, key),
-        descriptor);
+        key,
+        toJSI(runtime, item, depth + 1, nodes, defineProperty));
   }
   return result;
 }
 
 jsi::Value toJSI(jsi::Runtime& runtime, const rnquickjs::Value& value) {
   std::size_t nodes = 0;
-  return toJSI(runtime, value, 0, nodes);
+  return toJSI(runtime, value, 0, nodes, nullptr);
 }
 
 jsi::Object memoryToJSI(
@@ -1190,7 +1214,19 @@ class WorkerHostObject final : public jsi::HostObject,
         worker_.get_id() != std::this_thread::get_id()) {
       worker_.join();
     }
-    callbacks_.clear();
+
+    // Hermes may finalize HostObjects on a GC thread. The worker-side
+    // QuickJS callbacks can release their shared references off-thread, but
+    // keep the final jsi::Function releases on the React Native JS thread.
+    if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
+      auto callbacks = std::move(callbacks_);
+      callInvoker_->invokeAsync(
+          [callbacks = std::move(callbacks)]() mutable {
+            callbacks.clear();
+          });
+    } else {
+      callbacks_.clear();
+    }
   }
 
   jsi::Runtime& hostRuntime_;
@@ -1233,9 +1269,24 @@ class ContextHostObject final : public jsi::HostObject,
         jsThread_(std::this_thread::get_id()) {}
 
   ~ContextHostObject() override {
-    if (context_) {
-      context_->dispose();
+    if (!context_) {
+      return;
     }
+
+    // Hermes Hades may finalize HostObjects away from the JS thread. QuickJS
+    // contexts in the synchronous embedding path are JS-thread-affine, and
+    // disposing also releases retained JSI host callbacks.
+    if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
+      auto context = std::move(context_);
+      auto owner = std::move(owner_);
+      callInvoker_->invokeAsync(
+          [context = std::move(context), owner = std::move(owner)]() mutable {
+            context->dispose();
+            owner.reset();
+          });
+      return;
+    }
+    context_->dispose();
   }
 
   jsi::Value get(jsi::Runtime& runtime, const jsi::PropNameID& name) override;
@@ -1275,12 +1326,25 @@ class RuntimeHostObject final : public jsi::HostObject,
       std::shared_ptr<CallInvoker> callInvoker,
       rnquickjs::RuntimeOptions options)
       : callInvoker_(std::move(callInvoker)),
-        runtime_(std::make_unique<rnquickjs::QuickJSRuntime>(options)) {}
+        runtime_(std::make_unique<rnquickjs::QuickJSRuntime>(options)),
+        jsThread_(std::this_thread::get_id()) {}
 
   ~RuntimeHostObject() override {
-    if (runtime_) {
-      runtime_->dispose();
+    if (!runtime_) {
+      return;
     }
+
+    if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
+      std::shared_ptr<rnquickjs::QuickJSRuntime> runtime(
+          std::move(runtime_));
+      callInvoker_->invokeAsync(
+          [runtime = std::move(runtime)]() mutable {
+            runtime->dispose();
+            runtime.reset();
+          });
+      return;
+    }
+    runtime_->dispose();
   }
 
   jsi::Value get(jsi::Runtime& runtime, const jsi::PropNameID& name) override;
@@ -1309,6 +1373,7 @@ class RuntimeHostObject final : public jsi::HostObject,
 
   std::shared_ptr<CallInvoker> callInvoker_;
   std::unique_ptr<rnquickjs::QuickJSRuntime> runtime_;
+  std::thread::id jsThread_;
 };
 
 jsi::Value RuntimeHostObject::get(

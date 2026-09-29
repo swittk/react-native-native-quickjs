@@ -272,6 +272,9 @@ class QuickJSContext final {
   std::size_t pinDepth_ = 0;
   bool disposeRequested_ = false;
   JSValue promiseThen_ = JS_UNDEFINED;
+  JSValue objectPrototype_ = JS_UNDEFINED;
+  JSClassID objectClassId_ = 0;
+  JSClassID arrayClassId_ = 0;
   std::optional<ExecutionResult> asyncCompletionFailure_;
 
   mutable std::mutex outputMutex_;

@@ -108,6 +108,24 @@ int main() {
         afterHostileError.ok() && afterHostileError.value.has_value() &&
             number(*afterHostileError.value) == 42,
         "context remains reusable after hostile error metadata");
+
+    auto oversizedError = context->evaluate(
+        "throw new Error('x'.repeat(200000));",
+        "oversized-error.js");
+    check(
+        !oversizedError.ok() &&
+            oversizedError.error.name.size() <= 64 * 1024 &&
+            oversizedError.error.message.size() <= 64 * 1024 &&
+            oversizedError.error.stack.size() <= 64 * 1024,
+        "ordinary error metadata stays host-side bounded");
+
+    auto oversizedThrownString = context->evaluate(
+        "throw 'y'.repeat(200000);",
+        "oversized-thrown-string.js");
+    check(
+        !oversizedThrownString.ok() &&
+            oversizedThrownString.error.message.size() <= 64 * 1024,
+        "non-Error thrown stringification stays host-side bounded");
   }
 
   {
@@ -141,7 +159,8 @@ int main() {
         "Object.defineProperty(globalThis, 'lateAsyncHost', {"
         "  configurable: true,"
         "  set() { globalThis.registrationSetterCalls++; }"
-        "});",
+        "});"
+        "void 0;",
         "registration-setter-setup.js");
     check(setup.ok(), "host registration setter setup succeeds");
 
@@ -223,6 +242,90 @@ int main() {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
     context->registerHostFunction(
+        "plainOnly",
+        [](const std::vector<Value>& args) -> Value {
+          return Value{static_cast<int>(args.size())};
+        });
+
+    auto plain = context->evaluate(
+        "plainOnly({ value: 1 }) + plainOnly(Object.assign("
+        "Object.create(null), { value: 2 }))",
+        "plain-object-arguments.js");
+    check(
+        plain.ok() && plain.value.has_value() && number(*plain.value) == 2,
+        "plain and null-prototype objects cross the host bridge");
+
+    auto date = context->evaluate(
+        "try { plainOnly(new Date()); 'accepted'; }"
+        "catch (error) { error.name; }",
+        "non-plain-date.js");
+    check(
+        date.ok() && date.value.has_value() &&
+            std::get<std::string>(date.value->data) == "TypeError",
+        "Date instances are rejected as non-plain host arguments");
+
+    auto function = context->evaluate(
+        "try { plainOnly(function nope() {}); 'accepted'; }"
+        "catch (error) { error.name; }",
+        "non-plain-function.js");
+    check(
+        function.ok() && function.value.has_value() &&
+            std::get<std::string>(function.value->data) == "TypeError",
+        "functions are rejected as non-plain host arguments");
+
+    auto proxy = context->evaluate(
+        "globalThis.bridgeProxyTrapCalls = 0;"
+        "const proxy = new Proxy({}, {"
+        "  getPrototypeOf() { bridgeProxyTrapCalls++; return Object.prototype; }"
+        "});"
+        "let proxyError = '';"
+        "try { plainOnly(proxy); } catch (error) { proxyError = error.name; }"
+        "({ proxyError, trapCalls: bridgeProxyTrapCalls });",
+        "non-plain-proxy.js");
+    check(
+        proxy.ok() && proxy.value.has_value() &&
+            std::get<std::string>(
+                object(*proxy.value).at("proxyError").data) == "TypeError" &&
+            number(object(*proxy.value).at("trapCalls")) == 0,
+        "Proxy arguments are rejected without running getPrototypeOf traps");
+
+    auto arrayProxy = context->evaluate(
+        "globalThis.bridgeArrayProxyGetCalls = 0;"
+        "const arrayProxy = new Proxy([1, 2], {"
+        "  get(target, key, receiver) {"
+        "    bridgeArrayProxyGetCalls++;"
+        "    return Reflect.get(target, key, receiver);"
+        "  }"
+        "});"
+        "let arrayProxyError = '';"
+        "try { plainOnly(arrayProxy); }"
+        "catch (error) { arrayProxyError = error.name; }"
+        "({ arrayProxyError, getCalls: bridgeArrayProxyGetCalls });",
+        "non-plain-array-proxy.js");
+    check(
+        arrayProxy.ok() && arrayProxy.value.has_value() &&
+            std::get<std::string>(
+                object(*arrayProxy.value).at("arrayProxyError").data) ==
+                "TypeError" &&
+            number(object(*arrayProxy.value).at("getCalls")) == 0,
+        "Proxy-wrapped arrays are rejected without running guest traps");
+
+    auto dateResult = context->evaluate("new Date()", "non-plain-date-result.js");
+    check(
+        !dateResult.ok() && dateResult.reason == "value-conversion",
+        "Date results are rejected instead of silently becoming plain objects");
+
+    auto functionResult =
+        context->evaluate("(() => 42)", "non-plain-function-result.js");
+    check(
+        !functionResult.ok() && functionResult.reason == "value-conversion",
+        "function results are rejected instead of silently becoming plain objects");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    context->registerHostFunction(
         "hostObject",
         [](const std::vector<Value>&) -> Value {
           Value::Object value;
@@ -289,7 +392,8 @@ int main() {
         "    Promise.reject(1);"
         "    return 'nested';"
         "  }"
-        "});",
+        "});"
+        "void 0;",
         "rejection-reentrancy.js");
     check(setup.ok(), "reentrant rejection reason setup returns");
     auto called = context->evaluate(
@@ -311,10 +415,10 @@ int main() {
     auto second = runtime.createContext();
 
     auto firstSetup = first->evaluate(
-        "Promise.reject(new Error('first-context'));",
+        "Promise.reject(new Error('first-context')); void 0;",
         "first-context-rejection.js");
     auto secondSetup = second->evaluate(
-        "Promise.reject(new Error('second-context'));",
+        "Promise.reject(new Error('second-context')); void 0;",
         "second-context-rejection.js");
     check(firstSetup.ok() && secondSetup.ok(), "cross-context rejection setup succeeds");
 
@@ -340,7 +444,8 @@ int main() {
         "const big = 'x'.repeat(12000);"
         "for (let i = 0; i < 100; i++) {"
         "  Promise.reject(new Error(big + i));"
-        "}",
+        "}"
+        "void 0;",
         "bounded-rejections.js");
     check(setup.ok(), "bounded rejection flood setup succeeds");
 
@@ -365,7 +470,8 @@ int main() {
     auto context = runtime.createContext();
     auto setup = context->evaluate(
         "globalThis.jobValue = 0;"
-        "Promise.resolve(7).then(v => { globalThis.jobValue = v * 6; });",
+        "Promise.resolve(7).then(v => { globalThis.jobValue = v * 6; });"
+        "void 0;",
         "promise.js");
     check(setup.ok(), "promise setup succeeds");
     auto jobs = context->executePendingJobs();
@@ -445,6 +551,26 @@ int main() {
     check(
         context->pendingAsyncCount() == 0,
         "unresolved synchronous Promise releases host resolver handles");
+
+    context->registerAsyncHostFunction(
+        "neverCompleteFlood",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {});
+    auto boundedAsyncFlood = context->evaluate(
+        "let overflowName = '';"
+        "for (let i = 0; i < 2000; i++) {"
+        "  try { neverCompleteFlood(i); }"
+        "  catch (error) { overflowName = error.name; break; }"
+        "}"
+        "overflowName;",
+        "bounded-async-host-flood.js");
+    check(
+        boundedAsyncFlood.ok() && boundedAsyncFlood.value.has_value() &&
+            std::get<std::string>(boundedAsyncFlood.value->data) ==
+                "RangeError",
+        "async host call flood is bounded with a catchable guest error");
+    check(
+        context->pendingAsyncCount() == 1024,
+        "async host pending resolver count stays within its hard cap");
 
     auto rejected = context->evaluateAwaited(
         "await 0; throw new TypeError('x');",
@@ -534,7 +660,8 @@ int main() {
     auto setup = context->evaluate(
         "Object.defineProperty(globalThis, 'slowGlobal', {"
         "get() { for (;;) {} }"
-        "});",
+        "});"
+        "void 0;",
         "retain-global-setup.js");
     check(setup.ok(), "retainGlobal deadline setup succeeds");
 
@@ -1023,6 +1150,28 @@ int main() {
     check(
         context->outputWasTruncated(),
         "oversized console conversion reports truncated output");
+  }
+
+  {
+    RuntimeOptions options;
+    options.maxOutputBytes = 2;
+    options.maxOutputLines = 10;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+    auto logged = context->evaluate(
+        "console.log(); console.log(); console.log(); console.log(); 'ok';",
+        "console-separator-bound.js");
+    check(logged.ok(), "empty console lines respect output accounting");
+    check(
+        context->getOutput().size() <= options.maxOutputBytes,
+        "serialized console separators count against the output byte limit");
+    check(
+        context->outputWasTruncated(),
+        "console separator overflow reports truncated output");
+    const auto taken = context->takeOutput(1);
+    check(
+        taken.empty() && context->getOutput().size() <= options.maxOutputBytes,
+        "taking output preserves serialized byte accounting");
   }
 
   {

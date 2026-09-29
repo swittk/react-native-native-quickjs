@@ -913,33 +913,38 @@ class WorkerHostObject final : public jsi::HostObject,
 
         auto callback = std::make_shared<jsi::Function>(
             args[1].asObject(rt).asFunction(rt));
-        auto* callbackPointer = callback.get();
         auto* registry = self->callbackRegistry_;
+        registry->callbacks.push_back(callback);
+        auto* callbackPointer = callback.get();
         auto* hostRuntime = &self->hostRuntime_;
         const auto invoker = self->callInvoker_;
-        self->enqueue([
-            functionName,
-            hostRuntime,
-            invoker,
-            registry,
-            callbackPointer](
-                rnquickjs::QuickJSRuntime&,
-                rnquickjs::QuickJSContext& context) {
-          context.registerAsyncHostFunction(
+        try {
+          self->enqueue([
               functionName,
-              [hostRuntime, invoker, registry, callbackPointer](
-                  const std::vector<rnquickjs::Value>& values,
-                  rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
-                invokeAsyncOnJSThread(
-                    *hostRuntime,
-                    invoker,
-                    registry,
-                    callbackPointer,
-                    values,
-                    std::move(completion));
-              });
-        });
-        registry->callbacks.push_back(std::move(callback));
+              hostRuntime,
+              invoker,
+              registry,
+              callbackPointer](
+                  rnquickjs::QuickJSRuntime&,
+                  rnquickjs::QuickJSContext& context) {
+            context.registerAsyncHostFunction(
+                functionName,
+                [hostRuntime, invoker, registry, callbackPointer](
+                    const std::vector<rnquickjs::Value>& values,
+                    rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
+                  invokeAsyncOnJSThread(
+                      *hostRuntime,
+                      invoker,
+                      registry,
+                      callbackPointer,
+                      values,
+                      std::move(completion));
+                });
+          });
+        } catch (...) {
+          registry->callbacks.pop_back();
+          throw;
+        }
         return jsi::Value::undefined();
       });
     }

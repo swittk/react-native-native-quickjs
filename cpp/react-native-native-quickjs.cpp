@@ -483,6 +483,7 @@ rnquickjs::ErrorInfo errorFromJSI(
 void invokeAsyncOnJSThread(
     jsi::Runtime& runtime,
     const std::shared_ptr<CallInvoker>& callInvoker,
+    const std::shared_ptr<std::atomic<bool>>& dispatchAlive,
     const std::shared_ptr<jsi::Function>& callback,
     const std::vector<rnquickjs::Value>& arguments,
     rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
@@ -497,9 +498,15 @@ void invokeAsyncOnJSThread(
 
   callInvoker->invokeAsync([
       &runtime,
+      dispatchAlive,
       callback,
       arguments,
       completion = std::move(completion)]() mutable {
+    if (!dispatchAlive ||
+        !dispatchAlive->load(std::memory_order_acquire)) {
+      return;
+    }
+
     auto settle = std::make_shared<std::atomic<bool>>(false);
     const auto completeOnce =
         [settle, completion](rnquickjs::QuickJSContext::AsyncHostResult result) {
@@ -861,29 +868,32 @@ class WorkerHostObject final : public jsi::HostObject,
 
         auto callback = std::make_shared<jsi::Function>(
             args[1].asObject(rt).asFunction(rt));
-        self->callbacks_.push_back(callback);
         auto* hostRuntime = &self->hostRuntime_;
         const auto invoker = self->callInvoker_;
+        const auto dispatchAlive = self->callbackDispatchAlive_;
         self->enqueue([
             functionName,
             hostRuntime,
             invoker,
+            dispatchAlive,
             callback](
                 rnquickjs::QuickJSRuntime&,
                 rnquickjs::QuickJSContext& context) {
           context.registerAsyncHostFunction(
               functionName,
-              [hostRuntime, invoker, callback](
+              [hostRuntime, invoker, dispatchAlive, callback](
                   const std::vector<rnquickjs::Value>& values,
                   rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
                 invokeAsyncOnJSThread(
                     *hostRuntime,
                     invoker,
+                    dispatchAlive,
                     callback,
                     values,
                     std::move(completion));
               });
         });
+        self->callbacks_.push_back(std::move(callback));
         return jsi::Value::undefined();
       });
     }
@@ -1198,6 +1208,7 @@ class WorkerHostObject final : public jsi::HostObject,
       return;
     }
 
+    callbackDispatchAlive_->store(false, std::memory_order_release);
     cancellationGeneration_.fetch_add(
         1, std::memory_order_acq_rel);
     if (auto* quickjs =
@@ -1219,11 +1230,20 @@ class WorkerHostObject final : public jsi::HostObject,
     // QuickJS callbacks can release their shared references off-thread, but
     // keep the final jsi::Function releases on the React Native JS thread.
     if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
-      auto callbacks = std::move(callbacks_);
-      callInvoker_->invokeAsync(
-          [callbacks = std::move(callbacks)]() mutable {
-            callbacks.clear();
-          });
+      // Keep the payload behind a raw pointer so dropping the queued task
+      // during RN teardown leaks it instead of releasing jsi::Function
+      // handles on the wrong thread.
+      auto* callbacks =
+          new std::vector<std::shared_ptr<jsi::Function>>(
+              std::move(callbacks_));
+      try {
+        callInvoker_->invokeAsync([callbacks]() {
+          delete callbacks;
+        });
+      } catch (...) {
+        // The JS executor is already unavailable. Intentionally leak the
+        // callbacks rather than risk cross-thread JSI destruction.
+      }
     } else {
       callbacks_.clear();
     }
@@ -1240,6 +1260,8 @@ class WorkerHostObject final : public jsi::HostObject,
   std::deque<Command> commands_;
   std::deque<WorkerTaskResult> results_;
   std::vector<std::shared_ptr<jsi::Function>> callbacks_;
+  std::shared_ptr<std::atomic<bool>> callbackDispatchAlive_{
+      std::make_shared<std::atomic<bool>>(true)};
 
   std::atomic<rnquickjs::QuickJSRuntime*> activeRuntime_{nullptr};
   std::atomic<bool> executing_{false};
@@ -1277,13 +1299,21 @@ class ContextHostObject final : public jsi::HostObject,
     // contexts in the synchronous embedding path are JS-thread-affine, and
     // disposing also releases retained JSI host callbacks.
     if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
-      auto context = std::move(context_);
-      auto owner = std::move(owner_);
-      callInvoker_->invokeAsync(
-          [context = std::move(context), owner = std::move(owner)]() mutable {
-            context->dispose();
-            owner.reset();
-          });
+      struct DeferredContextCleanup {
+        std::shared_ptr<rnquickjs::QuickJSContext> context;
+        std::shared_ptr<RuntimeHostObject> owner;
+      };
+      auto* deferred = new DeferredContextCleanup{
+          std::move(context_), std::move(owner_)};
+      try {
+        callInvoker_->invokeAsync([deferred]() {
+          deferred->context->dispose();
+          delete deferred;
+        });
+      } catch (...) {
+        // If the JS executor is already gone, intentionally leak the payload
+        // rather than destroy QuickJS state on a Hermes GC thread.
+      }
       return;
     }
     context_->dispose();
@@ -1335,13 +1365,18 @@ class RuntimeHostObject final : public jsi::HostObject,
     }
 
     if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
-      std::shared_ptr<rnquickjs::QuickJSRuntime> runtime(
-          std::move(runtime_));
-      callInvoker_->invokeAsync(
-          [runtime = std::move(runtime)]() mutable {
-            runtime->dispose();
-            runtime.reset();
-          });
+      auto* deferred =
+          new std::unique_ptr<rnquickjs::QuickJSRuntime>(
+              std::move(runtime_));
+      try {
+        callInvoker_->invokeAsync([deferred]() {
+          (*deferred)->dispose();
+          delete deferred;
+        });
+      } catch (...) {
+        // If the JS executor is already gone, intentionally leak the payload
+        // rather than destroy QuickJS state on a Hermes GC thread.
+      }
       return;
     }
     runtime_->dispose();
@@ -1728,6 +1763,10 @@ void install(
   auto factory = makeFunction(runtime, kFactoryName, 1, [runtimeInvoker](
       jsi::Runtime& hostRuntime, const jsi::Value&, const jsi::Value* arguments,
       std::size_t count) {
+    if (!runtimeInvoker) {
+      throw jsi::JSError(
+          hostRuntime, "React Native CallInvoker is unavailable");
+    }
     auto hostObject = std::make_shared<RuntimeHostObject>(
         runtimeInvoker, runtimeOptions(hostRuntime, arguments, count));
     return jsi::Object::createFromHostObject(hostRuntime, std::move(hostObject));
@@ -1743,6 +1782,10 @@ void install(
           const jsi::Value&,
           const jsi::Value* arguments,
           std::size_t count) {
+        if (!callInvoker) {
+          throw jsi::JSError(
+              hostRuntime, "React Native CallInvoker is unavailable");
+        }
         auto worker = std::make_shared<WorkerHostObject>(
             hostRuntime,
             callInvoker,

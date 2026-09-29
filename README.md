@@ -169,8 +169,10 @@ the network.
 
 ## Architecture support
 
-The package keeps the RN 0.73 legacy bridge installation path and the current
-New Architecture `BindingsInstaller` path. Both install the same JSI factories:
+The package keeps the RN 0.73 legacy bridge installation path and uses an
+explicit synchronous `installBindings()` TurboModule path for New Architecture
+instead of version-sensitive JSI installer protocols. Both install the same JSI
+factories:
 
 - `SKRNNativeQuickJSCreateRuntime`
 - `SKRNNativeQuickJSCreateWorker`

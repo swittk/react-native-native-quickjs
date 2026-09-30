@@ -1796,8 +1796,9 @@ jsi::Value ContextHostObject::get(
       std::size_t maxJobs = 1'000;
       if (count > 0 && !args[0].isUndefined()) {
         if (!args[0].isNumber() || !std::isfinite(args[0].asNumber()) ||
-            args[0].asNumber() < 0 || args[0].asNumber() > kMaxSafeInteger) {
-          throw jsi::JSError(rt, "maxJobs must be a non-negative finite number");
+            args[0].asNumber() < 0 || args[0].asNumber() > kMaxSizeValue) {
+          throw jsi::JSError(
+              rt, "maxJobs must fit in the native size range");
         }
         maxJobs = static_cast<std::size_t>(args[0].asNumber());
       }
@@ -1814,8 +1815,9 @@ jsi::Value ContextHostObject::get(
       std::size_t requested = 0;
       if (count > 0 && !args[0].isUndefined()) {
         if (!args[0].isNumber() || !std::isfinite(args[0].asNumber()) ||
-            args[0].asNumber() < 0 || args[0].asNumber() > kMaxSafeInteger) {
-          throw jsi::JSError(rt, "Output count must be a non-negative finite number");
+            args[0].asNumber() < 0 || args[0].asNumber() > kMaxSizeValue) {
+          throw jsi::JSError(
+              rt, "Output count must fit in the native size range");
         }
         requested = static_cast<std::size_t>(args[0].asNumber());
       }

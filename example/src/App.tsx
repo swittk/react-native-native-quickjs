@@ -119,15 +119,23 @@ export default function App() {
   const runWorkerDemo = React.useCallback(async () => {
     const runId = ++workerRunRef.current;
     workerRef.current?.dispose();
-    const worker = createQuickJSWorker({
-      executionLimitMs: 250,
-      memoryLimitBytes: 16 * 1024 * 1024,
-      maxStackBytes: 1024 * 1024,
-      maxOutputBytes: 16 * 1024,
-      maxOutputLines: 128,
-    });
-    workerRef.current = worker;
     const lines: string[] = [];
+    let worker: QuickJSWorker;
+    try {
+      worker = createQuickJSWorker({
+        executionLimitMs: 250,
+        memoryLimitBytes: 16 * 1024 * 1024,
+        maxStackBytes: 1024 * 1024,
+        maxOutputBytes: 16 * 1024,
+        maxOutputLines: 128,
+      });
+    } catch (error) {
+      if (workerRunRef.current === runId) {
+        setReport('worker bridge error: ' + String(error));
+      }
+      return;
+    }
+    workerRef.current = worker;
 
     // Hermes may return an ordinary value or Promise here. QuickJS always sees
     // a real Promise, so guest code can use normal await/Promise.all.

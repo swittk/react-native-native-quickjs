@@ -39,7 +39,7 @@ const worker = createQuickJSWorker({
   maxStackBytes: 1024 * 1024,
 });
 
-worker.registerAsyncHostFunction('takePhoto', async () => {
+await worker.registerAsyncHostFunction('takePhoto', async () => {
   return await openNativePhotoPicker();
 });
 

@@ -175,7 +175,9 @@ class QuickJSContext final {
       const std::vector<Value>& args = {});
   void release(std::uint64_t handle);
 
-  ExecutionResult executePendingJobs(std::size_t maxJobs = 1'000);
+  ExecutionResult executePendingJobs(
+      std::size_t maxJobs = 1'000,
+      bool collectSuccessMemory = true);
 
   /** Owner-thread pump for completions queued by arbitrary host threads. */
   std::size_t processAsyncCompletions();

@@ -137,7 +137,7 @@ interface NativeQuickJSWorker {
   registerAsyncHostFunction(
     name: string,
     callback: QuickJSAsyncHostFunction
-  ): void;
+  ): number;
   addModule(name: string, source: string): void;
   removeModule(name: string): void;
   clearModules(): void;
@@ -244,7 +244,7 @@ export interface QuickJSWorker {
   registerAsyncHostFunction(
     name: string,
     callback: QuickJSAsyncHostFunction
-  ): void;
+  ): Promise<void>;
 
   addModule(name: string, source: string): void;
   removeModule(name: string): void;
@@ -448,8 +448,15 @@ export function createQuickJSWorker(
       return result.memory;
     },
     release: handle => native.release(handle),
-    registerAsyncHostFunction: (name, callback) =>
-      native.registerAsyncHostFunction(name, callback),
+    async registerAsyncHostFunction(name, callback): Promise<void> {
+      const result = await awaitWorkerTask(
+        native,
+        native.registerAsyncHostFunction(name, callback)
+      );
+      if (result.reason !== 'ok') {
+        throwWorkerResult(result);
+      }
+    },
     addModule: (name, source) => native.addModule(name, source),
     removeModule: name => native.removeModule(name),
     clearModules: () => native.clearModules(),

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -115,6 +116,20 @@ int main() {
     check(
         drained.ok() && drained.memory.memoryUsedBytes > 0,
         "public executePendingJobs preserves opted-in memory stats");
+
+    auto internalSetup = context->evaluate(
+        "Promise.resolve().then(() => 2); void 0;",
+        "internal-memory-stats-pending-jobs.js");
+    check(
+        internalSetup.ok(),
+        "internal memory-stats pending-job setup succeeds");
+    auto internalDrained = context->executePendingJobs(
+        std::numeric_limits<std::size_t>::max(), false);
+    check(
+        internalDrained.ok() &&
+            internalDrained.memory.memoryUsedBytes == 0 &&
+            internalDrained.memory.mallocBytes == 0,
+        "internal pending-job checkpoint skips success memory stats");
   }
 
   {
@@ -771,6 +786,40 @@ int main() {
             afterConversionStray.value.has_value() &&
             number(*afterConversionStray.value) == 2,
         "conversion-time stray rejection does not contaminate the next call");
+
+    auto workerLikeResult = context->evaluateAwaited(
+        "Promise.resolve().then(() =>"
+        "  Promise.reject(new Error('worker-checkpoint')));"
+        "5",
+        "worker-checkpoint.js",
+        EvalMode::AsyncScript);
+    check(
+        workerLikeResult.ok() &&
+            workerLikeResult.value.has_value() &&
+            number(*workerLikeResult.value) == 5,
+        "low-level awaited call leaves detached same-turn job explicit");
+    if (JS_IsJobPending(runtime.rawRuntime())) {
+      auto checkpoint = context->executePendingJobs(
+          std::numeric_limits<std::size_t>::max(), false);
+      if (workerLikeResult.ok() && !checkpoint.ok()) {
+        workerLikeResult = std::move(checkpoint);
+      }
+    }
+    check(
+        !workerLikeResult.ok() &&
+            workerLikeResult.reason == "promise-rejection" &&
+            workerLikeResult.error.message == "worker-checkpoint",
+        "worker task checkpoint attributes same-turn rejection to its task");
+
+    auto afterWorkerCheckpoint = context->evaluateAwaited(
+        "await 0; 4",
+        "after-worker-checkpoint.js",
+        EvalMode::AsyncScript);
+    check(
+        afterWorkerCheckpoint.ok() &&
+            afterWorkerCheckpoint.value.has_value() &&
+            number(*afterWorkerCheckpoint.value) == 4,
+        "worker task checkpoint keeps the next call clean");
   }
 
   {

@@ -3,6 +3,7 @@
 
 #include <ReactCommon/CallInvoker.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -520,6 +521,23 @@ void finishWorkerCallbackDispatch(WorkerCallbackRegistry* registry) noexcept {
   }
 }
 
+void releaseWorkerCallback(
+    WorkerCallbackRegistry* registry,
+    jsi::Function* callback) noexcept {
+  if (registry == nullptr || callback == nullptr) {
+    return;
+  }
+  const auto found = std::find_if(
+      registry->callbacks.begin(),
+      registry->callbacks.end(),
+      [callback](const std::shared_ptr<jsi::Function>& item) {
+        return item.get() == callback;
+      });
+  if (found != registry->callbacks.end()) {
+    registry->callbacks.erase(found);
+  }
+}
+
 rnquickjs::ErrorInfo errorFromJSI(
     jsi::Runtime& runtime,
     const jsi::Value& value) {
@@ -702,6 +720,7 @@ struct WorkerTaskResult {
   std::uint64_t taskId = 0;
   rnquickjs::ExecutionResult result;
   std::string output;
+  jsi::Function* callbackToReleaseOnFailure = nullptr;
 };
 
 class WorkerHostObject final : public jsi::HostObject,
@@ -991,6 +1010,9 @@ class WorkerHostObject final : public jsi::HostObject,
         }
         const auto functionName =
             requiredString(rt, args, count, 0, "Host function name");
+        if (functionName.empty()) {
+          throw jsi::JSError(rt, "Host function name cannot be empty");
+        }
         if (count < 2 || !args[1].isObject() ||
             !args[1].asObject(rt).isFunction(rt)) {
           throw jsi::JSError(
@@ -1001,6 +1023,9 @@ class WorkerHostObject final : public jsi::HostObject,
             args[1].asObject(rt).asFunction(rt));
         auto* hostRuntime = &self->hostRuntime_;
         const auto invoker = self->callInvoker_;
+
+        WorkerCallbackRegistry* registry = nullptr;
+        jsi::Function* callbackPointer = nullptr;
         {
           std::lock_guard<std::mutex> lock(self->mutex_);
           if (self->stopping_ ||
@@ -1008,40 +1033,41 @@ class WorkerHostObject final : public jsi::HostObject,
               self->callbackRegistry_ == nullptr) {
             throw jsi::JSError(rt, "QuickJS worker is disposed");
           }
-
-          auto* registry = self->callbackRegistry_;
+          registry = self->callbackRegistry_;
           registry->callbacks.push_back(callback);
-          auto* callbackPointer = callback.get();
-          try {
-            self->commands_.push_back([
-                functionName,
-                hostRuntime,
-                invoker,
-                registry,
-                callbackPointer](
-                    rnquickjs::QuickJSRuntime&,
-                    rnquickjs::QuickJSContext& context) {
-              context.registerAsyncHostFunction(
-                  functionName,
-                  [hostRuntime, invoker, registry, callbackPointer](
-                      const std::vector<rnquickjs::Value>& values,
-                      rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
-                    invokeAsyncOnJSThread(
-                        *hostRuntime,
-                        invoker,
-                        registry,
-                        callbackPointer,
-                        values,
-                        std::move(completion));
-                  });
-            });
-          } catch (...) {
-            registry->callbacks.pop_back();
-            throw;
-          }
+          callbackPointer = callback.get();
         }
-        self->condition_.notify_one();
-        return jsi::Value::undefined();
+
+        std::uint64_t taskId = 0;
+        try {
+          taskId = self->startTask([
+              functionName,
+              hostRuntime,
+              invoker,
+              registry,
+              callbackPointer](
+                  rnquickjs::QuickJSRuntime&,
+                  rnquickjs::QuickJSContext& context) {
+            context.registerAsyncHostFunction(
+                functionName,
+                [hostRuntime, invoker, registry, callbackPointer](
+                    const std::vector<rnquickjs::Value>& values,
+                    rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
+                  invokeAsyncOnJSThread(
+                      *hostRuntime,
+                      invoker,
+                      registry,
+                      callbackPointer,
+                      values,
+                      std::move(completion));
+                });
+            return rnquickjs::ExecutionResult{};
+          }, callbackPointer);
+        } catch (...) {
+          releaseWorkerCallback(registry, callbackPointer);
+          throw;
+        }
+        return jsi::Value(static_cast<double>(taskId));
       });
     }
 
@@ -1173,7 +1199,8 @@ class WorkerHostObject final : public jsi::HostObject,
   std::uint64_t startTask(
       std::function<rnquickjs::ExecutionResult(
           rnquickjs::QuickJSRuntime&,
-          rnquickjs::QuickJSContext&)> operation) {
+          rnquickjs::QuickJSContext&)> operation,
+      jsi::Function* callbackToReleaseOnFailure = nullptr) {
     const auto previousOutstanding =
         outstandingTasks_.fetch_add(1, std::memory_order_acq_rel);
     if (previousOutstanding >= kMaxWorkerOutstandingTasks) {
@@ -1191,6 +1218,7 @@ class WorkerHostObject final : public jsi::HostObject,
           this,
           taskId,
           cancellationGeneration,
+          callbackToReleaseOnFailure,
           operation = std::move(operation)](
               rnquickjs::QuickJSRuntime& quickjs,
               rnquickjs::QuickJSContext& context) mutable {
@@ -1232,6 +1260,19 @@ class WorkerHostObject final : public jsi::HostObject,
               markCancelled();
             } else {
               result = operation(quickjs, context);
+
+              // Worker tasks are task-isolated at the same-turn microtask
+              // boundary. Low-level QuickJSContext calls keep their existing
+              // behavior/performance; the worker pays only a cheap pending-job
+              // check when no microtasks were queued.
+              if (JS_IsJobPending(quickjs.rawRuntime())) {
+                auto jobs = context.executePendingJobs(
+                    std::numeric_limits<std::size_t>::max(), false);
+                if (result.ok() && !jobs.ok()) {
+                  result = std::move(jobs);
+                }
+              }
+              result.outputTruncated = context.outputWasTruncated();
             }
           }
         } catch (const std::exception& error) {
@@ -1253,8 +1294,11 @@ class WorkerHostObject final : public jsi::HostObject,
         auto output = context.takeOutput();
         {
           std::lock_guard<std::mutex> lock(mutex_);
-          results_.push_back(
-              WorkerTaskResult{taskId, std::move(result), std::move(output)});
+          results_.push_back(WorkerTaskResult{
+              taskId,
+              std::move(result),
+              std::move(output),
+              callbackToReleaseOnFailure});
         }
         executing_.store(false, std::memory_order_release);
         condition_.notify_all();
@@ -1290,6 +1334,12 @@ class WorkerHostObject final : public jsi::HostObject,
     }
     WorkerTaskResult result = std::move(*found);
     results_.erase(found);
+    if (!result.result.ok() &&
+        result.callbackToReleaseOnFailure != nullptr) {
+      releaseWorkerCallback(
+          callbackRegistry_, result.callbackToReleaseOnFailure);
+      result.callbackToReleaseOnFailure = nullptr;
+    }
     outstandingTasks_.fetch_sub(1, std::memory_order_acq_rel);
     return result;
   }

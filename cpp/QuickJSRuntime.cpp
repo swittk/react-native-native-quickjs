@@ -1155,7 +1155,9 @@ ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
   return result;
 }
 
-ExecutionResult QuickJSContext::executePendingJobs(std::size_t maxJobs) {
+ExecutionResult QuickJSContext::executePendingJobs(
+    std::size_t maxJobs,
+    bool collectSuccessMemory) {
   const auto started = std::chrono::steady_clock::now();
   if (!isOpen()) {
     ExecutionResult result;
@@ -1177,7 +1179,8 @@ ExecutionResult QuickJSContext::executePendingJobs(std::size_t maxJobs) {
   }
 
   beginExecution();
-  ExecutionResult result = drainPendingJobsInCurrentTurn(started, maxJobs);
+  ExecutionResult result = drainPendingJobsInCurrentTurn(
+      started, maxJobs, collectSuccessMemory);
   endExecution();
   return result;
 }

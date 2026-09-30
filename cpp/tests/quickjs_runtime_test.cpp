@@ -730,6 +730,25 @@ int main() {
         afterRejected.ok() && afterRejected.value.has_value() &&
             number(*afterRejected.value) == 1,
         "handled top-level rejection does not leak into later evaluation");
+
+    auto strayRejected = context->evaluateAwaited(
+        "Promise.reject(new Error('same-call')); 5",
+        "stray-rejection-same-call.js",
+        EvalMode::AsyncScript);
+    check(
+        !strayRejected.ok() &&
+            strayRejected.reason == "promise-rejection" &&
+            strayRejected.error.message == "same-call",
+        "stray rejection is attributed to the call that created it");
+
+    auto afterStray = context->evaluateAwaited(
+        "await 0; 1",
+        "after-stray-rejection.js",
+        EvalMode::AsyncScript);
+    check(
+        afterStray.ok() && afterStray.value.has_value() &&
+            number(*afterStray.value) == 1,
+        "stray rejection does not contaminate the next awaited call");
   }
 
   {
@@ -1513,6 +1532,16 @@ int main() {
     check(
         context->outputWasTruncated(),
         "oversized console conversion reports truncated output");
+    (void)context->takeOutput();
+    check(
+        !context->outputWasTruncated(),
+        "draining all output resets truncation state");
+    auto shortLogged = context->evaluate(
+        "console.log('ok'); 'ok';",
+        "console-output-after-drain.js");
+    check(
+        shortLogged.ok() && !context->outputWasTruncated(),
+        "short output after a full drain is not marked truncated");
   }
 
   {
@@ -1535,6 +1564,9 @@ int main() {
     check(
         taken.empty() && context->getOutput().size() <= options.maxOutputBytes,
         "taking output preserves serialized byte accounting");
+    check(
+        context->outputWasTruncated(),
+        "partial output drain preserves truncation state");
   }
 
   {

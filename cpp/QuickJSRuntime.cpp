@@ -1446,6 +1446,9 @@ std::string QuickJSContext::takeOutput(std::size_t count) {
     outputBytes_ -= serializedBytes;
     output_.pop_front();
   }
+  if (output_.empty()) {
+    outputTruncated_.store(false, std::memory_order_relaxed);
+  }
   return result;
 }
 
@@ -2019,10 +2022,19 @@ ExecutionResult QuickJSContext::awaitValue(
   if (state == JS_PROMISE_REJECTED) {
     ExecutionResult result = resultFromPromiseRejection(settled, started);
     JS_FreeValue(context_, settled);
+    (void)runtime_.consumeUnhandledRejection(context_);
     endExecution();
     return result;
   }
   ExecutionResult result = resultFromValue(settled, started);
+  if (result.ok()) {
+    if (auto rejection = runtime_.consumeUnhandledRejection(context_)) {
+      result.reason = "promise-rejection";
+      result.code = 1006;
+      result.error = std::move(*rejection);
+      result.value.reset();
+    }
+  }
   endExecution();
   return result;
 }

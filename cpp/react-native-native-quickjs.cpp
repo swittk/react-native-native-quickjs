@@ -867,6 +867,28 @@ class WorkerHostObject final : public jsi::HostObject,
       });
     }
 
+    if (property == "startMemory") {
+      return makeFunction(runtime, "startMemory", 0, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value*,
+          std::size_t) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        const auto taskId = self->startTask([](
+            rnquickjs::QuickJSRuntime& quickjs,
+            rnquickjs::QuickJSContext& context) {
+          rnquickjs::ExecutionResult result;
+          result.memory = quickjs.memoryStats();
+          result.outputTruncated = context.outputWasTruncated();
+          return result;
+        });
+        return jsi::Value(static_cast<double>(taskId));
+      });
+    }
+
     if (property == "takeTaskResult") {
       return makeFunction(runtime, "takeTaskResult", 1, [weakSelf](
           jsi::Runtime& rt,
@@ -1087,6 +1109,7 @@ class WorkerHostObject final : public jsi::HostObject,
         "startEvaluate",
         "startRetain",
         "startCall",
+        "startMemory",
         "takeTaskResult",
         "release",
         "registerAsyncHostFunction",

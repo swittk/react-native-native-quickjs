@@ -131,6 +131,7 @@ interface NativeQuickJSWorker {
   startEvaluate(source: string, options?: QuickJSEvaluateOptions): number;
   startRetain(sourceOrGlobal: string, options?: QuickJSRetainOptions): number;
   startCall(handle: number, args?: QuickJSValue[]): number;
+  startMemory(): number;
   takeTaskResult(taskId: number): QuickJSWorkerResult | null;
   release(handle: number): void;
   registerAsyncHostFunction(
@@ -230,6 +231,9 @@ export interface QuickJSWorker {
     handle: number,
     args?: QuickJSValue[]
   ): Promise<QuickJSWorkerResult<T>>;
+
+  /** Collect a full QuickJS heap snapshot on the native worker thread. */
+  memoryAsync(): Promise<QuickJSMemoryStats>;
 
   release(handle: number): void;
 
@@ -435,6 +439,13 @@ export function createQuickJSWorker(
       args?: QuickJSValue[]
     ): Promise<QuickJSWorkerResult<T>> {
       return awaitWorkerTask<T>(native, native.startCall(handle, args));
+    },
+    async memoryAsync(): Promise<QuickJSMemoryStats> {
+      const result = await awaitWorkerTask(native, native.startMemory());
+      if (result.reason !== 'ok') {
+        throwWorkerResult(result);
+      }
+      return result.memory;
     },
     release: handle => native.release(handle),
     registerAsyncHostFunction: (name, callback) =>

@@ -149,8 +149,8 @@ per-turn timeout.
 
 Per-result memory snapshots are also opt-in. `JS_ComputeMemoryUsage` walks the
 QuickJS heap, so `collectResultMemoryStats` defaults to `false` to keep retained
-callback and async-resume paths fast. `runtime.memory` remains available for
-explicit on-demand diagnostics.
+callback and async-resume paths fast. `runtime.memory` and
+`await worker.memoryAsync()` remain available for explicit on-demand diagnostics.
 
 Time spent waiting for an external host Promise does **not** consume a configured
 JavaScript execution deadline. When the Promise settles, the resumed QuickJS

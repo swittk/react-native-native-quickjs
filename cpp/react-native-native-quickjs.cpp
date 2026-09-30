@@ -43,29 +43,55 @@ void countNode(int depth, std::size_t& nodes) {
   }
 }
 
-bool isPlainObject(jsi::Runtime& runtime, const jsi::Object& object) {
+struct JSIBridgeHelpers {
+  std::optional<jsi::Function> getPrototypeOf;
+  std::optional<jsi::Object> objectPrototype;
+  std::optional<jsi::Function> keys;
+
+  void ensure(jsi::Runtime& runtime) {
+    if (keys.has_value()) {
+      return;
+    }
+    auto objectConstructor =
+        runtime.global().getPropertyAsObject(runtime, "Object");
+    getPrototypeOf.emplace(
+        objectConstructor.getPropertyAsFunction(runtime, "getPrototypeOf"));
+    objectPrototype.emplace(
+        objectConstructor.getPropertyAsObject(runtime, "prototype"));
+    keys.emplace(
+        objectConstructor.getPropertyAsFunction(runtime, "keys"));
+  }
+};
+
+bool isPlainObject(
+    jsi::Runtime& runtime,
+    const jsi::Object& object,
+    JSIBridgeHelpers& helpers) {
   if (object.isHostObject(runtime) || object.isFunction(runtime) ||
       object.isArrayBuffer(runtime)) {
     return false;
   }
 
-  const auto objectConstructor =
-      runtime.global().getPropertyAsObject(runtime, "Object");
-  const auto getPrototypeOf =
-      objectConstructor.getPropertyAsFunction(runtime, "getPrototypeOf");
-  const auto prototype =
-      objectConstructor.getPropertyAsObject(runtime, "prototype");
-  const auto actual = getPrototypeOf.call(runtime, object);
+  helpers.ensure(runtime);
+  const auto actual = helpers.getPrototypeOf->call(runtime, object);
   return actual.isNull() ||
       (actual.isObject() && jsi::Object::strictEquals(
-          runtime, actual.asObject(runtime), prototype));
+          runtime, actual.asObject(runtime), *helpers.objectPrototype));
+}
+
+bool isPlainObject(
+    jsi::Runtime& runtime,
+    const jsi::Object& object) {
+  JSIBridgeHelpers helpers;
+  return isPlainObject(runtime, object, helpers);
 }
 
 rnquickjs::Value fromJSI(
     jsi::Runtime& runtime,
     const jsi::Value& value,
     int depth,
-    std::size_t& nodes) {
+    std::size_t& nodes,
+    JSIBridgeHelpers& helpers) {
   countNode(depth, nodes);
   if (value.isUndefined()) {
     return rnquickjs::Value{};
@@ -98,20 +124,19 @@ rnquickjs::Value fromJSI(
     result.reserve(size);
     for (std::size_t index = 0; index < size; ++index) {
       const auto item = array.getValueAtIndex(runtime, index);
-      result.push_back(fromJSI(runtime, item, depth + 1, nodes));
+      result.push_back(
+          fromJSI(runtime, item, depth + 1, nodes, helpers));
     }
     return rnquickjs::Value{std::move(result)};
   }
 
-  if (!isPlainObject(runtime, object)) {
+  if (!isPlainObject(runtime, object, helpers)) {
     throw std::runtime_error("Only plain objects can cross the QuickJS bridge");
   }
 
-  const auto objectConstructor =
-      runtime.global().getPropertyAsObject(runtime, "Object");
-  const auto keysFunction =
-      objectConstructor.getPropertyAsFunction(runtime, "keys");
-  auto keys = keysFunction.call(runtime, object).asObject(runtime).asArray(runtime);
+  helpers.ensure(runtime);
+  auto keys =
+      helpers.keys->call(runtime, object).asObject(runtime).asArray(runtime);
   const auto size = keys.size(runtime);
   if (size > kMaxBridgeNodes) {
     throw std::runtime_error("Object exceeds QuickJS bridge conversion limits");
@@ -123,14 +148,17 @@ rnquickjs::Value fromJSI(
     const auto keyString = keyValue.asString(runtime);
     const auto key = keyString.utf8(runtime);
     const auto item = object.getProperty(runtime, keyString);
-    result.emplace(key, fromJSI(runtime, item, depth + 1, nodes));
+    result.emplace(
+        key,
+        fromJSI(runtime, item, depth + 1, nodes, helpers));
   }
   return rnquickjs::Value{std::move(result)};
 }
 
 rnquickjs::Value fromJSI(jsi::Runtime& runtime, const jsi::Value& value) {
   std::size_t nodes = 0;
-  return fromJSI(runtime, value, 0, nodes);
+  JSIBridgeHelpers helpers;
+  return fromJSI(runtime, value, 0, nodes, helpers);
 }
 
 void defineOwnDataProperty(
@@ -861,12 +889,14 @@ class WorkerHostObject final : public jsi::HostObject,
           const auto size = array.size(rt);
           values.reserve(size);
           std::size_t nodes = 0;
+          JSIBridgeHelpers helpers;
           for (std::size_t index = 0; index < size; ++index) {
             values.push_back(fromJSI(
                 rt,
                 array.getValueAtIndex(rt, index),
                 0,
-                nodes));
+                nodes,
+                helpers));
           }
         }
 
@@ -1788,9 +1818,10 @@ jsi::Value ContextHostObject::get(
         const auto size = array.size(rt);
         values.reserve(size);
         std::size_t nodes = 0;
+        JSIBridgeHelpers helpers;
         for (std::size_t index = 0; index < size; ++index) {
           const auto value = array.getValueAtIndex(rt, index);
-          values.push_back(fromJSI(rt, value, 0, nodes));
+          values.push_back(fromJSI(rt, value, 0, nodes, helpers));
         }
       }
       return resultToJSI(rt, self->requireContext(rt).call(handle, values));

@@ -742,7 +742,9 @@ class WorkerHostObject final : public jsi::HostObject,
     const std::weak_ptr<WorkerHostObject> weakSelf = shared_from_this();
 
     if (property == "valid") {
-      return jsi::Value(!disposed_.load(std::memory_order_relaxed));
+      return jsi::Value(
+          !disposed_.load(std::memory_order_relaxed) &&
+          !failed_.load(std::memory_order_relaxed));
     }
     if (property == "executing") {
       return jsi::Value(executing_.load(std::memory_order_relaxed));
@@ -1332,9 +1334,19 @@ class WorkerHostObject final : public jsi::HostObject,
         try {
           command(quickjs, *context);
         } catch (...) {
-          // Task commands translate their own exceptions. Configuration
-          // commands are validated on the host side; do not kill the VM if a
-          // late native error slips through.
+          // Task operations translate ordinary QuickJS/host failures into
+          // results themselves. Reaching this boundary means delivery or a
+          // configuration command failed unexpectedly (for example host OOM).
+          // Stop the worker so JS pollers observe valid=false instead of
+          // waiting forever for a result that can no longer be delivered.
+          executing_.store(false, std::memory_order_release);
+          failed_.store(true, std::memory_order_release);
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            commands_.clear();
+          }
+          condition_.notify_all();
         }
       }
 
@@ -1434,6 +1446,7 @@ class WorkerHostObject final : public jsi::HostObject,
   rnquickjs::QuickJSRuntime* activeRuntime_ = nullptr;
   std::atomic<bool> executing_{false};
   std::atomic<bool> disposed_{false};
+  std::atomic<bool> failed_{false};
   std::atomic<std::uint64_t> cancellationGeneration_{0};
   std::atomic<std::size_t> outstandingTasks_{0};
   bool ready_ = false;

@@ -24,13 +24,20 @@ export default function App() {
 
   const runDemo = React.useCallback(() => {
     runtimeRef.current?.dispose();
-    const runtime = createQuickJSRuntime({
-      executionLimitMs: 100,
-      memoryLimitBytes: 16 * 1024 * 1024,
-      maxStackBytes: 1024 * 1024,
-      maxOutputBytes: 16 * 1024,
-      maxOutputLines: 128,
-    });
+    runtimeRef.current = undefined;
+    let runtime: QuickJSRuntime;
+    try {
+      runtime = createQuickJSRuntime({
+        executionLimitMs: 100,
+        memoryLimitBytes: 16 * 1024 * 1024,
+        maxStackBytes: 1024 * 1024,
+        maxOutputBytes: 16 * 1024,
+        maxOutputLines: 128,
+      });
+    } catch (error) {
+      setReport(`bridge error: ${String(error)}`);
+      return;
+    }
     runtimeRef.current = runtime;
     const lines: string[] = [];
     let context: ReturnType<QuickJSRuntime['createContext']> | undefined;

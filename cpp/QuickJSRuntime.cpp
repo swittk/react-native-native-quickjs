@@ -1313,6 +1313,14 @@ std::size_t QuickJSContext::pendingAsyncCount() const {
   return pendingPromises_.size();
 }
 
+std::size_t QuickJSContext::queuedAsyncCompletionCount() const {
+  if (!asyncState_) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(asyncState_->mutex);
+  return asyncState_->completions.size();
+}
+
 void QuickJSContext::notifyAsyncActivity() noexcept {
   if (asyncState_) {
     asyncState_->activity.notify_all();
@@ -1329,6 +1337,7 @@ void QuickJSContext::clearPendingAsyncPromises() noexcept {
   pendingPromises_.clear();
   if (asyncState_) {
     std::lock_guard<std::mutex> lock(asyncState_->mutex);
+    asyncState_->activeRequests.clear();
     asyncState_->completions.clear();
   }
 }
@@ -1566,7 +1575,12 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
       requestId,
       PendingPromise{resolving[0], resolving[1]});
 
-  const std::weak_ptr<AsyncState> weakState = self->asyncState_;
+  const auto asyncState = self->asyncState_;
+  {
+    std::lock_guard<std::mutex> lock(asyncState->mutex);
+    asyncState->activeRequests.insert(requestId);
+  }
+  const std::weak_ptr<AsyncState> weakState = asyncState;
   const auto completionClaimed =
       std::make_shared<std::atomic<bool>>(false);
   auto complete = [weakState, requestId, completionClaimed](
@@ -1582,7 +1596,8 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
     }
     {
       std::lock_guard<std::mutex> lock(state->mutex);
-      if (!state->alive.load(std::memory_order_relaxed)) {
+      if (!state->alive.load(std::memory_order_relaxed) ||
+          state->activeRequests.erase(requestId) == 0) {
         return;
       }
       state->completions.push_back(

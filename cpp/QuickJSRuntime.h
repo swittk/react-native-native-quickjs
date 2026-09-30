@@ -177,6 +177,7 @@ class QuickJSContext final {
   /** Owner-thread pump for completions queued by arbitrary host threads. */
   std::size_t processAsyncCompletions();
   std::size_t pendingAsyncCount() const;
+  std::size_t queuedAsyncCompletionCount() const;
   void notifyAsyncActivity() noexcept;
 
   std::string getOutput(std::size_t count = 0) const;
@@ -279,6 +280,7 @@ class QuickJSContext final {
     mutable std::mutex mutex;
     std::condition_variable activity;
     std::deque<QueuedAsyncCompletion> completions;
+    std::unordered_set<std::uint64_t> activeRequests;
   };
 
   QuickJSRuntime& runtime_;

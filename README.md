@@ -165,7 +165,9 @@ await worker.evaluateAsync(
 ```
 
 An import that was not registered is denied. There is no fallback to disk or
-the network.
+the network. `removeModule()` and `clearModules()` remove sources from future
+resolution; modules already loaded by an existing QuickJS context remain in
+that context's normal module cache.
 
 ## Architecture support
 

@@ -587,6 +587,29 @@ int main() {
         context->pendingAsyncCount() == 0,
         "unresolved synchronous Promise releases host resolver handles");
 
+    QuickJSContext::AsyncHostCompletion completeAfterPending;
+    context->registerAsyncHostFunction(
+        "lateAfterPending",
+        [&completeAfterPending](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          completeAfterPending = std::move(complete);
+        });
+    auto stalePending = context->evaluate(
+        "await lateAfterPending(); 42",
+        "late-after-pending.js",
+        EvalMode::AsyncScript);
+    check(
+        !stalePending.ok() && stalePending.reason == "pending-promise" &&
+            static_cast<bool>(completeAfterPending),
+        "late-completion regression setup returns pending-promise");
+    QuickJSContext::AsyncHostResult staleCompletion;
+    staleCompletion.value = Value{42};
+    completeAfterPending(std::move(staleCompletion));
+    check(
+        context->queuedAsyncCompletionCount() == 0,
+        "late completion after pending-promise cleanup is dropped");
+
     context->registerAsyncHostFunction(
         "neverCompleteFlood",
         [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {});
@@ -1327,6 +1350,24 @@ int main() {
         asyncValue.ok() && asyncValue.value.has_value() &&
             number(*asyncValue.value) == 43,
         "async module side effect visible after top-level await");
+
+    runtime.removeModule("math");
+    auto cached = context->evaluate(
+        "import { answer } from 'math'; globalThis.cachedModuleAnswer = answer;",
+        "cached-entry.mjs",
+        EvalMode::Module);
+    check(
+        cached.ok(),
+        "already-loaded module remains cached after source removal");
+    auto freshContext = runtime.createContext();
+    auto removedForFreshContext = freshContext->evaluate(
+        "import { answer } from 'math'; globalThis.noLongerAvailable = answer;",
+        "fresh-context-after-remove.mjs",
+        EvalMode::Module);
+    check(
+        !removedForFreshContext.ok() &&
+            removedForFreshContext.reason == "module-denied",
+        "removed module is denied for future resolution in a fresh context");
 
     auto denied = context->evaluate(
         "import value from 'not-granted'; globalThis.nope = value;",

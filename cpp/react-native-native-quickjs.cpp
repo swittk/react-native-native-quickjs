@@ -136,18 +136,15 @@ rnquickjs::Value fromJSI(jsi::Runtime& runtime, const jsi::Value& value) {
 void defineOwnDataProperty(
     jsi::Runtime& runtime,
     jsi::Function& defineProperty,
+    jsi::Object& descriptor,
     jsi::Object& target,
-    const std::string& key,
+    jsi::Value key,
     jsi::Value value) {
-  jsi::Object descriptor(runtime);
   descriptor.setProperty(runtime, "value", std::move(value));
-  descriptor.setProperty(runtime, "writable", true);
-  descriptor.setProperty(runtime, "enumerable", true);
-  descriptor.setProperty(runtime, "configurable", true);
   defineProperty.call(
       runtime,
       target,
-      jsi::String::createFromUtf8(runtime, key),
+      std::move(key),
       descriptor);
 }
 
@@ -156,7 +153,8 @@ jsi::Value toJSI(
     const rnquickjs::Value& value,
     int depth,
     std::size_t& nodes,
-    jsi::Function* defineProperty) {
+    jsi::Function* defineProperty,
+    jsi::Object* descriptor) {
   countNode(depth, nodes);
   if (std::holds_alternative<std::monostate>(value.data)) {
     return jsi::Value::undefined();
@@ -174,12 +172,18 @@ jsi::Value toJSI(
     return jsi::String::createFromUtf8(runtime, *string);
   }
   std::optional<jsi::Function> ownedDefineProperty;
+  std::optional<jsi::Object> ownedDescriptor;
   if (defineProperty == nullptr) {
     ownedDefineProperty.emplace(
         runtime.global()
             .getPropertyAsObject(runtime, "Object")
             .getPropertyAsFunction(runtime, "defineProperty"));
+    ownedDescriptor.emplace(runtime);
+    ownedDescriptor->setProperty(runtime, "writable", true);
+    ownedDescriptor->setProperty(runtime, "enumerable", true);
+    ownedDescriptor->setProperty(runtime, "configurable", true);
     defineProperty = &*ownedDefineProperty;
+    descriptor = &*ownedDescriptor;
   }
 
   if (const auto* values = std::get_if<rnquickjs::Value::Array>(&value.data)) {
@@ -188,14 +192,16 @@ jsi::Value toJSI(
       defineOwnDataProperty(
           runtime,
           *defineProperty,
+          *descriptor,
           result,
-          std::to_string(index),
+          jsi::Value(static_cast<double>(index)),
           toJSI(
               runtime,
               (*values)[index],
               depth + 1,
               nodes,
-              defineProperty));
+              defineProperty,
+              descriptor));
     }
     return result;
   }
@@ -205,16 +211,23 @@ jsi::Value toJSI(
     defineOwnDataProperty(
         runtime,
         *defineProperty,
+        *descriptor,
         result,
-        key,
-        toJSI(runtime, item, depth + 1, nodes, defineProperty));
+        jsi::String::createFromUtf8(runtime, key),
+        toJSI(
+            runtime,
+            item,
+            depth + 1,
+            nodes,
+            defineProperty,
+            descriptor));
   }
   return result;
 }
 
 jsi::Value toJSI(jsi::Runtime& runtime, const rnquickjs::Value& value) {
   std::size_t nodes = 0;
-  return toJSI(runtime, value, 0, nodes, nullptr);
+  return toJSI(runtime, value, 0, nodes, nullptr, nullptr);
 }
 
 jsi::Object memoryToJSI(
@@ -321,7 +334,8 @@ rnquickjs::RuntimeOptions runtimeOptions(
   result.executionLimitMs = requestedExecutionLimit <= 0
       ? 0
       : static_cast<std::int64_t>(
-            std::min(requestedExecutionLimit, kMaxExecutionLimitMs));
+            std::ceil(
+                std::min(requestedExecutionLimit, kMaxExecutionLimitMs)));
   result.memoryLimitBytes = optionalSize(
       runtime, options, "memoryLimitBytes", result.memoryLimitBytes);
   result.maxStackBytes =
@@ -1637,7 +1651,7 @@ jsi::Value RuntimeHostObject::get(
             requested <= 0
                 ? 0
                 : static_cast<std::int64_t>(
-                      std::min(requested, kMaxExecutionLimitMs)));
+                      std::ceil(std::min(requested, kMaxExecutionLimitMs))));
       } else {
         if (requested > kMaxSizeValue) {
           throw jsi::JSError(rt, "QuickJS byte limit exceeds the native size range");

@@ -32,10 +32,11 @@ export default function App() {
       maxOutputLines: 128,
     });
     runtimeRef.current = runtime;
-    const context = runtime.createContext();
     const lines: string[] = [];
+    let context: ReturnType<QuickJSRuntime['createContext']> | undefined;
 
     try {
+      context = runtime.createContext();
       lines.push(describe('eval', context.evaluate('6 * 7')));
 
       context.registerHostFunction('hostAdd', (a, b) =>
@@ -110,7 +111,7 @@ export default function App() {
     } catch (error) {
       lines.push(`bridge error: ${String(error)}`);
     } finally {
-      context.dispose();
+      context?.dispose();
     }
 
     setReport(lines.join('\n'));

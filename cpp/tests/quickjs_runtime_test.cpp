@@ -79,6 +79,14 @@ int main() {
     check(result.ok(), "simple eval succeeds");
     check(result.value.has_value(), "simple eval exposes value");
     check(result.value.has_value() && number(*result.value) == 3, "simple eval returns 3");
+    check(
+        result.memory.memoryUsedBytes == 0 &&
+            result.memory.mallocBytes == 0 &&
+            result.memory.objectCount == 0,
+        "per-result memory stats are disabled by default");
+    check(
+        runtime.memoryStats().memoryUsedBytes > 0,
+        "on-demand runtime memory stats remain available");
 
     auto bridged = context->evaluate(
         "({ hello: 'world', list: [1, true, null] })", "object.js");
@@ -87,6 +95,17 @@ int main() {
         bridged.value.has_value() &&
             std::get<std::string>(object(*bridged.value).at("hello").data) == "world",
         "object bridge preserves properties");
+  }
+
+  {
+    RuntimeOptions options;
+    options.collectResultMemoryStats = true;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+    auto result = context->evaluate("21 * 2", "memory-stats-opt-in.js");
+    check(
+        result.ok() && result.memory.memoryUsedBytes > 0,
+        "per-result memory stats are available when explicitly enabled");
   }
 
   {
@@ -414,6 +433,50 @@ int main() {
           number(value.at("setterCalls")) == 0,
           "host value conversion does not invoke guest setters");
     }
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    context->registerHostFunction(
+        "echoObjectKeys",
+        [](const std::vector<Value>& args) -> Value {
+          return args.empty() ? Value{} : args[0];
+        });
+    auto result = context->evaluate(
+        "const input = {};"
+        "input['a\\u0000b'] = 1;"
+        "input['a'] = 2;"
+        "const output = echoObjectKeys(input);"
+        "({ keys: Object.keys(output), first: output['a\\u0000b'], second: output.a });",
+        "embedded-nul-keys.js");
+    bool preserved = false;
+    if (result.ok() && result.value.has_value()) {
+      const auto& resultObject = object(*result.value);
+      const auto foundKeys = resultObject.find("keys");
+      if (foundKeys != resultObject.end() &&
+          std::holds_alternative<Value::Array>(foundKeys->second.data)) {
+        const auto& keys = std::get<Value::Array>(foundKeys->second.data);
+        bool foundEmbeddedNul = false;
+        bool foundPlainA = false;
+        for (const auto& keyValue : keys) {
+          if (!std::holds_alternative<std::string>(keyValue.data)) {
+            continue;
+          }
+          const auto& key = std::get<std::string>(keyValue.data);
+          foundEmbeddedNul =
+              foundEmbeddedNul || key == std::string("a\0b", 3);
+          foundPlainA = foundPlainA || key == "a";
+        }
+        preserved =
+            keys.size() == 2 && foundEmbeddedNul && foundPlainA &&
+            number(resultObject.at("first")) == 1 &&
+            number(resultObject.at("second")) == 2;
+      }
+    }
+    check(
+        preserved,
+        "embedded-NUL object keys remain distinct across the host bridge");
   }
 
   {

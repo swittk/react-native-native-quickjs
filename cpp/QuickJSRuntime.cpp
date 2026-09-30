@@ -352,6 +352,10 @@ MemoryStats QuickJSRuntime::memoryStats() const noexcept {
   return result;
 }
 
+MemoryStats QuickJSRuntime::resultMemoryStats() const noexcept {
+  return options_.collectResultMemoryStats ? memoryStats() : MemoryStats{};
+}
+
 void QuickJSRuntime::dispose() noexcept {
   if (runtime_ == nullptr || isExecuting()) {
     return;
@@ -1098,7 +1102,7 @@ ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
         result.durationMs = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - started)
                                 .count();
-        result.memory = runtime_.memoryStats();
+        result.memory = runtime_.resultMemoryStats();
         result.outputTruncated = outputWasTruncated();
         return result;
       }
@@ -1128,7 +1132,7 @@ ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
   result.durationMs = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - started)
                           .count();
-  result.memory = runtime_.memoryStats();
+  result.memory = runtime_.resultMemoryStats();
   result.outputTruncated = outputWasTruncated();
   return result;
 }
@@ -1149,7 +1153,7 @@ ExecutionResult QuickJSContext::executePendingJobs(std::size_t maxJobs) {
     failure->durationMs = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started)
                               .count();
-    failure->memory = runtime_.memoryStats();
+    failure->memory = runtime_.resultMemoryStats();
     failure->outputTruncated = outputWasTruncated();
     return std::move(*failure);
   }
@@ -1717,7 +1721,7 @@ ExecutionResult QuickJSContext::resultFromValue(
   result.durationMs = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - started)
                           .count();
-  result.memory = runtime_.memoryStats();
+  result.memory = runtime_.resultMemoryStats();
   result.outputTruncated = outputWasTruncated();
   return result;
 }
@@ -1748,7 +1752,7 @@ ExecutionResult QuickJSContext::awaitValue(
     result.durationMs = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - started)
                             .count();
-    result.memory = runtime_.memoryStats();
+    result.memory = runtime_.resultMemoryStats();
     result.outputTruncated = outputWasTruncated();
     return result;
   }
@@ -1766,7 +1770,7 @@ ExecutionResult QuickJSContext::awaitValue(
       result.durationMs = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started)
                               .count();
-      result.memory = runtime_.memoryStats();
+      result.memory = runtime_.resultMemoryStats();
       result.outputTruncated = outputWasTruncated();
       return result;
     }
@@ -1778,7 +1782,7 @@ ExecutionResult QuickJSContext::awaitValue(
       failure->durationMs = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - started)
                                 .count();
-      failure->memory = runtime_.memoryStats();
+      failure->memory = runtime_.resultMemoryStats();
       failure->outputTruncated = outputWasTruncated();
       return std::move(*failure);
     }
@@ -1814,7 +1818,7 @@ ExecutionResult QuickJSContext::awaitValue(
       result.durationMs = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started)
                               .count();
-      result.memory = runtime_.memoryStats();
+      result.memory = runtime_.resultMemoryStats();
       result.outputTruncated = outputWasTruncated();
       return result;
     }
@@ -1908,7 +1912,7 @@ ExecutionResult QuickJSContext::resultFromCurrentException(
   result.durationMs = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - started)
                           .count();
-  result.memory = runtime_.memoryStats();
+  result.memory = runtime_.resultMemoryStats();
   result.outputTruncated = outputWasTruncated();
   return result;
 }
@@ -1933,7 +1937,7 @@ ExecutionResult QuickJSContext::resultFromPromiseRejection(
   result.durationMs = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - started)
                           .count();
-  result.memory = runtime_.memoryStats();
+  result.memory = runtime_.resultMemoryStats();
   result.outputTruncated = outputWasTruncated();
   return result;
 }
@@ -2110,11 +2114,14 @@ Value QuickJSContext::fromJSValue(
     Value::Object object;
     try {
       for (uint32_t index = 0; index < count; ++index) {
-        const char* keyText = JS_AtomToCString(context_, properties[index].atom);
+        size_t keyLength = 0;
+        const char* keyText =
+            JS_AtomToCStringLen(
+                context_, &keyLength, properties[index].atom);
         if (keyText == nullptr) {
           throw std::runtime_error("Unable to convert QuickJS object key");
         }
-        std::string key(keyText);
+        std::string key(keyText, keyLength);
         JS_FreeCString(context_, keyText);
 
         JSValue item =
@@ -2195,9 +2202,20 @@ JSValue QuickJSContext::toJSValue(
   }
   for (const auto& [key, itemValue] : object) {
     JSValue item = toJSValue(itemValue, depth + 1, nodeCount);
-    if (JS_IsException(item) ||
-        JS_DefinePropertyValueStr(
-            context_, result, key.c_str(), item, JS_PROP_C_W_E) < 0) {
+    if (JS_IsException(item)) {
+      JS_FreeValue(context_, result);
+      return JS_EXCEPTION;
+    }
+    JSAtom atom = JS_NewAtomLen(context_, key.data(), key.size());
+    if (atom == JS_ATOM_NULL) {
+      JS_FreeValue(context_, item);
+      JS_FreeValue(context_, result);
+      return JS_EXCEPTION;
+    }
+    const int status = JS_DefinePropertyValue(
+        context_, result, atom, item, JS_PROP_C_W_E);
+    JS_FreeAtom(context_, atom);
+    if (status < 0) {
       JS_FreeValue(context_, result);
       return JS_EXCEPTION;
     }

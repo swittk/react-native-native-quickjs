@@ -120,8 +120,9 @@ rnquickjs::Value fromJSI(
   rnquickjs::Value::Object result;
   for (std::size_t index = 0; index < size; ++index) {
     const auto keyValue = keys.getValueAtIndex(runtime, index);
-    const auto key = keyValue.asString(runtime).utf8(runtime);
-    const auto item = object.getProperty(runtime, key.c_str());
+    const auto keyString = keyValue.asString(runtime);
+    const auto key = keyString.utf8(runtime);
+    const auto item = object.getProperty(runtime, keyString);
     result.emplace(key, fromJSI(runtime, item, depth + 1, nodes));
   }
   return rnquickjs::Value{std::move(result)};
@@ -258,6 +259,21 @@ jsi::Object resultToJSI(
   return value;
 }
 
+bool optionalBoolean(
+    jsi::Runtime& runtime,
+    const jsi::Object& object,
+    const char* name,
+    bool fallback) {
+  const auto value = object.getProperty(runtime, name);
+  if (value.isUndefined()) {
+    return fallback;
+  }
+  if (!value.isBool()) {
+    throw jsi::JSError(runtime, std::string(name) + " must be a boolean");
+  }
+  return value.getBool();
+}
+
 double optionalNumber(
     jsi::Runtime& runtime,
     const jsi::Object& object,
@@ -314,6 +330,8 @@ rnquickjs::RuntimeOptions runtimeOptions(
       optionalSize(runtime, options, "maxOutputBytes", result.maxOutputBytes);
   result.maxOutputLines =
       optionalSize(runtime, options, "maxOutputLines", result.maxOutputLines);
+  result.collectResultMemoryStats = optionalBoolean(
+      runtime, options, "collectResultMemoryStats", result.collectResultMemoryStats);
   return result;
 }
 
@@ -800,7 +818,7 @@ class WorkerHostObject final : public jsi::HostObject,
           result.durationMs = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - started)
                                   .count();
-          result.memory = quickjs.memoryStats();
+          result.memory = quickjs.resultMemoryStats();
           result.outputTruncated = context.outputWasTruncated();
           return result;
         });
@@ -1118,7 +1136,7 @@ class WorkerHostObject final : public jsi::HostObject,
           result.code = 1001;
           result.error.name = "InternalError";
           result.error.message = "Execution cancelled";
-          result.memory = quickjs.memoryStats();
+          result.memory = quickjs.resultMemoryStats();
           result.outputTruncated = context.outputWasTruncated();
         };
         const auto markDestroyed = [&] {
@@ -1126,7 +1144,7 @@ class WorkerHostObject final : public jsi::HostObject,
           result.code = 1003;
           result.error.name = "Error";
           result.error.message = "QuickJS worker is disposed";
-          result.memory = quickjs.memoryStats();
+          result.memory = quickjs.resultMemoryStats();
           result.outputTruncated = context.outputWasTruncated();
         };
 
@@ -1155,14 +1173,14 @@ class WorkerHostObject final : public jsi::HostObject,
           result.code = 1;
           result.error.name = "Error";
           result.error.message = error.what();
-          result.memory = quickjs.memoryStats();
+          result.memory = quickjs.resultMemoryStats();
           result.outputTruncated = context.outputWasTruncated();
         } catch (...) {
           result.reason = "runtime";
           result.code = 1;
           result.error.name = "Error";
           result.error.message = "Unknown QuickJS worker failure";
-          result.memory = quickjs.memoryStats();
+          result.memory = quickjs.resultMemoryStats();
           result.outputTruncated = context.outputWasTruncated();
         }
 

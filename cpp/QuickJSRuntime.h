@@ -57,6 +57,9 @@ struct RuntimeOptions {
   std::size_t maxStackBytes = 2 * 1024 * 1024;
   std::size_t maxOutputBytes = 64 * 1024;
   std::size_t maxOutputLines = 1'000;
+  // JS_ComputeMemoryUsage walks the whole QuickJS heap. Keep per-result
+  // snapshots off the hot path unless diagnostics explicitly request them.
+  bool collectResultMemoryStats = false;
 };
 
 enum class EvalMode {
@@ -337,6 +340,7 @@ class QuickJSRuntime final {
   std::size_t maxStackBytes() const noexcept;
 
   MemoryStats memoryStats() const noexcept;
+  MemoryStats resultMemoryStats() const noexcept;
 
   void dispose() noexcept;
   bool isOpen() const noexcept;

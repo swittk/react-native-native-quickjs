@@ -50,6 +50,13 @@ export interface QuickJSRuntimeOptions {
   maxStackBytes?: number;
   maxOutputBytes?: number;
   maxOutputLines?: number;
+  /**
+   * Include a full QuickJS heap snapshot in every execution result.
+   *
+   * Defaults to false because collecting it walks the QuickJS heap. Use
+   * runtime.memory for on-demand diagnostics without taxing hot call paths.
+   */
+  collectResultMemoryStats?: boolean;
 }
 
 export interface QuickJSEvaluateOptions {

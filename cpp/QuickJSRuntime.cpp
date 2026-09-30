@@ -2027,8 +2027,8 @@ ExecutionResult QuickJSContext::awaitValue(
     return result;
   }
   ExecutionResult result = resultFromValue(settled, started);
-  if (result.ok()) {
-    if (auto rejection = runtime_.consumeUnhandledRejection(context_)) {
+  if (auto rejection = runtime_.consumeUnhandledRejection(context_)) {
+    if (result.ok()) {
       result.reason = "promise-rejection";
       result.code = 1006;
       result.error = std::move(*rejection);

@@ -749,6 +749,28 @@ int main() {
         afterStray.ok() && afterStray.value.has_value() &&
             number(*afterStray.value) == 1,
         "stray rejection does not contaminate the next awaited call");
+
+    auto conversionWithStray = context->evaluateAwaited(
+        "await 0; ({ get x() {"
+        "  Promise.reject(new Error('conversion-stray'));"
+        "  return new Date();"
+        "} })",
+        "conversion-with-stray-rejection.js",
+        EvalMode::AsyncScript);
+    check(
+        !conversionWithStray.ok() &&
+            conversionWithStray.reason == "value-conversion",
+        "conversion failure remains the primary result over a stray rejection");
+
+    auto afterConversionStray = context->evaluateAwaited(
+        "await 0; 2",
+        "after-conversion-stray.js",
+        EvalMode::AsyncScript);
+    check(
+        afterConversionStray.ok() &&
+            afterConversionStray.value.has_value() &&
+            number(*afterConversionStray.value) == 2,
+        "conversion-time stray rejection does not contaminate the next call");
   }
 
   {

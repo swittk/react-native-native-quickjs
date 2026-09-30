@@ -110,6 +110,23 @@ void discardException(JSContext* context) noexcept {
   JS_FreeValue(context, exception);
 }
 
+struct ScopedQuickJSCString {
+  JSContext* context = nullptr;
+  const char* text = nullptr;
+
+  ScopedQuickJSCString(JSContext* contextValue, const char* textValue) noexcept
+      : context(contextValue), text(textValue) {}
+
+  ~ScopedQuickJSCString() {
+    if (context != nullptr && text != nullptr) {
+      JS_FreeCString(context, text);
+    }
+  }
+
+  ScopedQuickJSCString(const ScopedQuickJSCString&) = delete;
+  ScopedQuickJSCString& operator=(const ScopedQuickJSCString&) = delete;
+};
+
 std::string bestEffortToString(
     JSContext* context,
     JSValueConst value,
@@ -120,10 +137,9 @@ std::string bestEffortToString(
     discardException(context);
     return {};
   }
+  ScopedQuickJSCString ownedText{context, text};
   const std::size_t copyLength = std::min(length, maxBytes);
-  std::string result(text, copyLength);
-  JS_FreeCString(context, text);
-  return result;
+  return std::string(text, copyLength);
 }
 
 std::string stringProperty(
@@ -157,10 +173,9 @@ std::string boundedStringValue(
     discardException(context);
     return {};
   }
+  ScopedQuickJSCString ownedText{context, text};
   const std::size_t copyLength = std::min(length, maxBytes);
-  std::string result(text, copyLength);
-  JS_FreeCString(context, text);
-  return result;
+  return std::string(text, copyLength);
 }
 
 std::string boundedOwnDataStringProperty(
@@ -2186,9 +2201,8 @@ Value QuickJSContext::fromJSValue(
     if (text == nullptr) {
       throw std::runtime_error("Unable to convert QuickJS string");
     }
-    Value result{std::string(text, length)};
-    JS_FreeCString(context_, text);
-    return result;
+    ScopedQuickJSCString ownedText{context_, text};
+    return Value{std::string(text, length)};
   }
 
   if (JS_IsObject(value) &&
@@ -2267,8 +2281,8 @@ Value QuickJSContext::fromJSValue(
         if (keyText == nullptr) {
           throw std::runtime_error("Unable to convert QuickJS object key");
         }
+        ScopedQuickJSCString ownedKeyText{context_, keyText};
         std::string key(keyText, keyLength);
-        JS_FreeCString(context_, keyText);
 
         JSValue item =
             JS_GetProperty(context_, value, properties[index].atom);

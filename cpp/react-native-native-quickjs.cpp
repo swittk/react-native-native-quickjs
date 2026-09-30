@@ -1076,10 +1076,7 @@ class WorkerHostObject final : public jsi::HostObject,
         if (const auto self = weakSelf.lock()) {
           self->cancellationGeneration_.fetch_add(
               1, std::memory_order_acq_rel);
-          if (auto* quickjs =
-                  self->activeRuntime_.load(std::memory_order_acquire)) {
-            quickjs->requestCancellation();
-          }
+          self->requestActiveRuntimeCancellation();
         }
         return jsi::Value::undefined();
       });
@@ -1251,11 +1248,23 @@ class WorkerHostObject final : public jsi::HostObject,
     return result;
   }
 
+  void setActiveRuntime(rnquickjs::QuickJSRuntime* runtime) noexcept {
+    std::lock_guard<std::mutex> lock(activeRuntimeMutex_);
+    activeRuntime_ = runtime;
+  }
+
+  void requestActiveRuntimeCancellation() noexcept {
+    std::lock_guard<std::mutex> lock(activeRuntimeMutex_);
+    if (activeRuntime_ != nullptr) {
+      activeRuntime_->requestCancellation();
+    }
+  }
+
   void workerMain() noexcept {
     try {
       rnquickjs::QuickJSRuntime quickjs(options_);
       auto context = quickjs.createContext();
-      activeRuntime_.store(&quickjs, std::memory_order_release);
+      setActiveRuntime(&quickjs);
       {
         std::lock_guard<std::mutex> lock(mutex_);
         ready_ = true;
@@ -1285,18 +1294,18 @@ class WorkerHostObject final : public jsi::HostObject,
         }
       }
 
-      activeRuntime_.store(nullptr, std::memory_order_release);
+      setActiveRuntime(nullptr);
       context->dispose();
       quickjs.dispose();
     } catch (const std::exception& error) {
-      activeRuntime_.store(nullptr, std::memory_order_release);
+      setActiveRuntime(nullptr);
       std::lock_guard<std::mutex> lock(mutex_);
       startupError_ = error.what();
       ready_ = true;
       stopping_ = true;
       condition_.notify_all();
     } catch (...) {
-      activeRuntime_.store(nullptr, std::memory_order_release);
+      setActiveRuntime(nullptr);
       std::lock_guard<std::mutex> lock(mutex_);
       startupError_ = "Unknown QuickJS worker startup failure";
       ready_ = true;
@@ -1312,10 +1321,7 @@ class WorkerHostObject final : public jsi::HostObject,
 
     cancellationGeneration_.fetch_add(
         1, std::memory_order_acq_rel);
-    if (auto* quickjs =
-            activeRuntime_.load(std::memory_order_acquire)) {
-      quickjs->requestCancellation();
-    }
+    requestActiveRuntimeCancellation();
     {
       std::lock_guard<std::mutex> lock(mutex_);
       stopping_ = true;
@@ -1380,7 +1386,8 @@ class WorkerHostObject final : public jsi::HostObject,
   std::deque<WorkerTaskResult> results_;
   WorkerCallbackRegistry* callbackRegistry_ = nullptr;
 
-  std::atomic<rnquickjs::QuickJSRuntime*> activeRuntime_{nullptr};
+  std::mutex activeRuntimeMutex_;
+  rnquickjs::QuickJSRuntime* activeRuntime_ = nullptr;
   std::atomic<bool> executing_{false};
   std::atomic<bool> disposed_{false};
   std::atomic<std::uint64_t> cancellationGeneration_{0};

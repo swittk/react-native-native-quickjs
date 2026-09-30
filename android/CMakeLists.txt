@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.13)
 project(SKRNNativeQuickJS)
 
 set(CMAKE_C_STANDARD 11)
-if(REACT_NATIVE_MINOR_VERSION GREATER_EQUAL 80)
+if(RNQJS_RN_AT_LEAST_0_80)
   set(CMAKE_CXX_STANDARD 20)
 else()
   set(CMAKE_CXX_STANDARD 17)
@@ -44,7 +44,7 @@ target_include_directories(SKRNNativeQuickJS PRIVATE
 
 find_package(fbjni REQUIRED CONFIG)
 find_package(ReactAndroid REQUIRED CONFIG)
-if(REACT_NATIVE_MINOR_VERSION GREATER_EQUAL 76)
+if(RNQJS_RN_AT_LEAST_0_76)
   target_link_libraries(SKRNNativeQuickJS
       ReactAndroid::reactnative
       ReactAndroid::jsi

@@ -57,21 +57,24 @@ if (!reactNativeVersionMatch.find()) {
 def reactNativeMajorVersion = reactNativeVersionMatch.group(1).toInteger()
 def reactNativeMinorVersion = reactNativeVersionMatch.group(2).toInteger()
 def reactNativePatchVersion = reactNativeVersionMatch.group(3).toInteger()
+def rnAtLeastMinor = { int minor ->
+  reactNativeMajorVersion > 0 || reactNativeMinorVersion >= minor
+}
 if (reactNativeMajorVersion == 0 &&
     (reactNativeMinorVersion < 73 ||
         (reactNativeMinorVersion == 73 && reactNativePatchVersion < 6))) {
   throw new GradleException("react-native-native-quickjs requires React Native 0.73.6 or newer")
 }
 def rnMinSdkVersion = reactNativeVersionValue(
-    "minSdk", reactNativeMinorVersion >= 80 ? 24 : 21).toInteger()
+    "minSdk", rnAtLeastMinor(80) ? 24 : 21).toInteger()
 def rnTargetSdkVersion = reactNativeVersionValue(
-    "targetSdk", reactNativeMinorVersion >= 80 ? 35 : 34).toInteger()
+    "targetSdk", rnAtLeastMinor(80) ? 35 : 34).toInteger()
 def rnCompileSdkVersion = reactNativeVersionValue(
-    "compileSdk", reactNativeMinorVersion >= 80 ? 35 : 34).toInteger()
+    "compileSdk", rnAtLeastMinor(80) ? 35 : 34).toInteger()
 def rnNdkVersion = reactNativeVersionValue(
-    "ndkVersion", reactNativeMinorVersion >= 80 ? "27.1.12297006" : "25.1.8937393")
+    "ndkVersion", rnAtLeastMinor(80) ? "27.1.12297006" : "25.1.8937393")
 def rnFbjniVersion = reactNativeVersionValue(
-    "fbjni", reactNativeMinorVersion >= 76 ? "0.7.0" : "0.5.1")
+    "fbjni", rnAtLeastMinor(76) ? "0.7.0" : "0.5.1")
 
 def newArchitectureEnabled =
     project.hasProperty("newArchEnabled") && project.property("newArchEnabled") == "true"
@@ -109,7 +112,8 @@ android {
       cmake {
         cppFlags "-O2 -frtti -fexceptions -Wall -fstack-protector-all"
         arguments "-DNODE_MODULES_DIR=${nodeModules}",
-            "-DREACT_NATIVE_MINOR_VERSION=${reactNativeMinorVersion}",
+            "-DRNQJS_RN_AT_LEAST_0_76=${rnAtLeastMinor(76)}",
+            "-DRNQJS_RN_AT_LEAST_0_80=${rnAtLeastMinor(80)}",
             "-DRNQJS_NEW_ARCH_ENABLED=${newArchitectureEnabled}",
             "-DANDROID_STL=c++_shared"
         if (reactNativeArchitectures != null) {

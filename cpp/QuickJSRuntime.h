@@ -245,7 +245,8 @@ class QuickJSContext final {
   std::optional<ExecutionResult> takeAsyncCompletionFailure();
   ExecutionResult drainPendingJobsInCurrentTurn(
       std::chrono::steady_clock::time_point started,
-      std::size_t maxJobs = 1'000);
+      std::size_t maxJobs = 1'000,
+      bool collectSuccessMemory = true);
 
   Value fromJSValue(JSValue value, int depth = 0, std::size_t* nodeCount = nullptr);
   JSValue toJSValue(const Value& value, int depth = 0, std::size_t* nodeCount = nullptr);

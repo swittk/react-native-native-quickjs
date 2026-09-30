@@ -106,6 +106,15 @@ int main() {
     check(
         result.ok() && result.memory.memoryUsedBytes > 0,
         "per-result memory stats are available when explicitly enabled");
+
+    auto queuedJob = context->evaluate(
+        "Promise.resolve().then(() => 1); void 0;",
+        "memory-stats-pending-jobs.js");
+    check(queuedJob.ok(), "memory-stats pending-job setup succeeds");
+    auto drained = context->executePendingJobs();
+    check(
+        drained.ok() && drained.memory.memoryUsedBytes > 0,
+        "public executePendingJobs preserves opted-in memory stats");
   }
 
   {

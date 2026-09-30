@@ -1073,7 +1073,8 @@ void QuickJSContext::release(std::uint64_t handle) {
 
 ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
     std::chrono::steady_clock::time_point started,
-    std::size_t maxJobs) {
+    std::size_t maxJobs,
+    bool collectSuccessMemory) {
   std::size_t jobs = 0;
   while (JS_IsJobPending(runtime_.rawRuntime()) && jobs < maxJobs) {
     JSContext* jobContext = nullptr;
@@ -1132,7 +1133,9 @@ ExecutionResult QuickJSContext::drainPendingJobsInCurrentTurn(
   result.durationMs = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - started)
                           .count();
-  result.memory = runtime_.resultMemoryStats();
+  if (!result.ok() || collectSuccessMemory) {
+    result.memory = runtime_.resultMemoryStats();
+  }
   result.outputTruncated = outputWasTruncated();
   return result;
 }
@@ -1934,7 +1937,7 @@ ExecutionResult QuickJSContext::awaitValue(
       // in an external await (photo picker, BLE, database, etc.) is excluded.
       beginExecution();
       ExecutionResult jobs = drainPendingJobsInCurrentTurn(
-          started, std::numeric_limits<std::size_t>::max());
+          started, std::numeric_limits<std::size_t>::max(), false);
       endExecution();
       if (!jobs.ok()) {
         JS_FreeValue(context_, value);

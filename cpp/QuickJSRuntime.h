@@ -284,6 +284,7 @@ class QuickJSContext final {
     std::condition_variable activity;
     std::deque<QueuedAsyncCompletion> completions;
     std::unordered_set<std::uint64_t> activeRequests;
+    bool completionQueueFailed = false;
   };
 
   QuickJSRuntime& runtime_;

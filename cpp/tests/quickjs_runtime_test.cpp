@@ -1104,6 +1104,33 @@ int main() {
   }
 
   {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+    context->registerAsyncHostFunction(
+        "throwingHost",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {
+          throw std::runtime_error("host callback threw");
+        });
+
+    auto awaited = context->evaluateAwaited(
+        "try { await throwingHost(); } catch (error) { "
+        "globalThis.thrownHostError = error.name + ':' + error.message; }",
+        "async-host-throw.js",
+        EvalMode::AsyncScript);
+    check(
+        awaited.ok(),
+        "thrown async host exception becomes a catchable Promise rejection");
+
+    auto error =
+        context->evaluate("globalThis.thrownHostError", "host-throw-error.js");
+    check(
+        error.ok() && error.value.has_value() &&
+            std::get<std::string>(error.value->data) ==
+                "Error:host callback threw",
+        "thrown async host exception preserves its message");
+  }
+
+  {
     RuntimeOptions options;
     options.executionLimitMs = 20;
     QuickJSRuntime runtime(options);

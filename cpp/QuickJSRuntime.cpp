@@ -1171,9 +1171,22 @@ std::size_t QuickJSContext::processAsyncCompletions() {
   ContextPin pin(*this);
 
   std::deque<QueuedAsyncCompletion> completions;
+  bool completionQueueFailed = false;
   {
     std::lock_guard<std::mutex> lock(asyncState_->mutex);
+    completionQueueFailed = asyncState_->completionQueueFailed;
+    asyncState_->completionQueueFailed = false;
     completions.swap(asyncState_->completions);
+  }
+  if (completionQueueFailed) {
+    ExecutionResult failure;
+    failure.reason = "runtime";
+    failure.code = 1;
+    failure.error.name = "HostError";
+    failure.error.message = "Unable to queue async host completion";
+    asyncCompletionFailure_ = std::move(failure);
+    clearPendingAsyncPromises();
+    return 0;
   }
   if (completions.empty()) {
     return 0;
@@ -1343,6 +1356,7 @@ void QuickJSContext::clearPendingAsyncPromises() noexcept {
     std::lock_guard<std::mutex> lock(asyncState_->mutex);
     asyncState_->activeRequests.clear();
     asyncState_->completions.clear();
+    asyncState_->completionQueueFailed = false;
   }
 }
 
@@ -1513,14 +1527,21 @@ JSValue QuickJSContext::hostFunctionThunk(
     for (int index = 0; index < argc; ++index) {
       args.push_back(self->fromJSValue(argv[index], 0, &nodes));
     }
+  } catch (const std::bad_alloc&) {
+    return JS_ThrowOutOfMemory(context);
   } catch (const std::exception& error) {
     return JS_ThrowTypeError(context, "%s", error.what());
+  } catch (...) {
+    return JS_ThrowInternalError(
+        context, "Unknown host argument conversion failure");
   }
 
   try {
     const Value result = found->second(args);
     std::size_t nodes = 0;
     return self->toJSValue(result, 0, &nodes);
+  } catch (const std::bad_alloc&) {
+    return JS_ThrowOutOfMemory(context);
   } catch (const std::exception& error) {
     return JS_ThrowInternalError(context, "%s", error.what());
   } catch (...) {
@@ -1559,13 +1580,29 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
     for (int index = 0; index < argc; ++index) {
       args.push_back(self->fromJSValue(argv[index], 0, &nodes));
     }
+  } catch (const std::bad_alloc&) {
+    return JS_ThrowOutOfMemory(context);
   } catch (const std::exception& error) {
     return JS_ThrowTypeError(context, "%s", error.what());
+  } catch (...) {
+    return JS_ThrowInternalError(
+        context, "Unknown async host argument conversion failure");
   }
 
   if (self->pendingPromises_.size() >= kMaxPendingAsyncHostCalls) {
     return JS_ThrowRangeError(
         context, "Too many pending async host calls");
+  }
+
+  std::shared_ptr<std::atomic<bool>> completionClaimed;
+  try {
+    completionClaimed =
+        std::make_shared<std::atomic<bool>>(false);
+  } catch (const std::bad_alloc&) {
+    return JS_ThrowOutOfMemory(context);
+  } catch (...) {
+    return JS_ThrowInternalError(
+        context, "Unable to allocate async host completion state");
   }
 
   JSValue resolving[2] = {JS_UNDEFINED, JS_UNDEFINED};
@@ -1575,55 +1612,146 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
   }
 
   const std::uint64_t requestId = self->nextAsyncRequestId_++;
-  self->pendingPromises_.emplace(
-      requestId,
-      PendingPromise{resolving[0], resolving[1]});
-
   const auto asyncState = self->asyncState_;
-  {
-    std::lock_guard<std::mutex> lock(asyncState->mutex);
-    asyncState->activeRequests.insert(requestId);
+  bool pendingInserted = false;
+  bool activeInserted = false;
+
+  const auto rollbackSetup = [&]() noexcept {
+    if (activeInserted && asyncState) {
+      try {
+        std::lock_guard<std::mutex> lock(asyncState->mutex);
+        asyncState->activeRequests.erase(requestId);
+      } catch (...) {
+      }
+    }
+
+    if (pendingInserted) {
+      const auto pending = self->pendingPromises_.find(requestId);
+      if (pending != self->pendingPromises_.end()) {
+        JS_FreeValue(context, pending->second.resolve);
+        JS_FreeValue(context, pending->second.reject);
+        self->pendingPromises_.erase(pending);
+      }
+    } else {
+      JS_FreeValue(context, resolving[0]);
+      JS_FreeValue(context, resolving[1]);
+    }
+    JS_FreeValue(context, promise);
+  };
+
+  try {
+    const auto pending = self->pendingPromises_.emplace(
+        requestId,
+        PendingPromise{resolving[0], resolving[1]});
+    if (!pending.second) {
+      rollbackSetup();
+      return JS_ThrowInternalError(
+          context, "Duplicate async host request id");
+    }
+    pendingInserted = true;
+
+    {
+      std::lock_guard<std::mutex> lock(asyncState->mutex);
+      activeInserted =
+          asyncState->activeRequests.insert(requestId).second;
+    }
+    if (!activeInserted) {
+      rollbackSetup();
+      return JS_ThrowInternalError(
+          context, "Duplicate active async host request id");
+    }
+  } catch (const std::bad_alloc&) {
+    rollbackSetup();
+    return JS_ThrowOutOfMemory(context);
+  } catch (const std::exception& error) {
+    rollbackSetup();
+    return JS_ThrowInternalError(context, "%s", error.what());
+  } catch (...) {
+    rollbackSetup();
+    return JS_ThrowInternalError(
+        context, "Unable to initialize async host request");
   }
+
   const std::weak_ptr<AsyncState> weakState = asyncState;
-  const auto completionClaimed =
-      std::make_shared<std::atomic<bool>>(false);
+  const auto markCompletionQueueFailure = [weakState]() noexcept {
+    const auto state = weakState.lock();
+    if (!state) {
+      return;
+    }
+    try {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (state->alive.load(std::memory_order_relaxed)) {
+        state->completionQueueFailed = true;
+      }
+    } catch (...) {
+      return;
+    }
+    state->activity.notify_all();
+  };
+
   auto complete = [weakState, requestId, completionClaimed](
-                      AsyncHostResult result) {
+                      AsyncHostResult result) noexcept {
     bool expected = false;
     if (!completionClaimed->compare_exchange_strong(
             expected, true, std::memory_order_acq_rel)) {
       return;
     }
+
     const auto state = weakState.lock();
     if (!state || !state->alive.load(std::memory_order_relaxed)) {
       return;
     }
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      if (!state->alive.load(std::memory_order_relaxed) ||
-          state->activeRequests.erase(requestId) == 0) {
+
+    try {
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->alive.load(std::memory_order_relaxed) ||
+            state->activeRequests.find(requestId) ==
+                state->activeRequests.end()) {
+          return;
+        }
+        state->completions.push_back(
+            QueuedAsyncCompletion{requestId, std::move(result)});
+        state->activeRequests.erase(requestId);
+      }
+      state->activity.notify_all();
+    } catch (...) {
+      try {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->alive.load(std::memory_order_relaxed)) {
+          state->completionQueueFailed = true;
+        }
+      } catch (...) {
         return;
       }
-      state->completions.push_back(
-          QueuedAsyncCompletion{requestId, std::move(result)});
+      state->activity.notify_all();
     }
-    state->activity.notify_all();
   };
 
   try {
     found->second(args, complete);
+  } catch (const std::bad_alloc&) {
+    if (!completionClaimed->load(std::memory_order_acquire)) {
+      markCompletionQueueFailure();
+    }
   } catch (const std::exception& error) {
-    AsyncHostResult result;
-    result.ok = false;
-    result.error.name = "Error";
-    result.error.message = error.what();
-    complete(std::move(result));
+    if (!completionClaimed->load(std::memory_order_acquire)) {
+      try {
+        AsyncHostResult result;
+        result.ok = false;
+        result.error.name = "Error";
+        result.error.message = error.what();
+        complete(std::move(result));
+      } catch (...) {
+        markCompletionQueueFailure();
+      }
+    }
   } catch (...) {
-    AsyncHostResult result;
-    result.ok = false;
-    result.error.name = "Error";
-    result.error.message = "Unknown async host function failure";
-    complete(std::move(result));
+    if (!completionClaimed->load(std::memory_order_acquire)) {
+      AsyncHostResult result;
+      result.ok = false;
+      complete(std::move(result));
+    }
   }
 
   return promise;
@@ -1640,38 +1768,52 @@ JSValue QuickJSContext::consoleLogThunk(
     return JS_UNDEFINED;
   }
 
-  const std::size_t byteLimit = self->runtime_.options().maxOutputBytes;
-  std::string line;
-  bool truncated = false;
-  const auto appendBounded = [&](const char* text, std::size_t length) {
-    const std::size_t remaining =
-        line.size() < byteLimit ? byteLimit - line.size() : 0;
-    const std::size_t copyLength = std::min(length, remaining);
-    if (copyLength > 0) {
-      line.append(text, copyLength);
-    }
-    if (copyLength < length) {
-      truncated = true;
-    }
-  };
+  try {
+    const std::size_t byteLimit = self->runtime_.options().maxOutputBytes;
+    std::string line;
+    bool truncated = false;
+    const auto appendBounded = [&](const char* text, std::size_t length) {
+      const std::size_t remaining =
+          line.size() < byteLimit ? byteLimit - line.size() : 0;
+      const std::size_t copyLength = std::min(length, remaining);
+      if (copyLength > 0) {
+        line.append(text, copyLength);
+      }
+      if (copyLength < length) {
+        truncated = true;
+      }
+    };
 
-  for (int index = 0; index < argc; ++index) {
-    if (index > 0) {
-      appendBounded("\t", 1);
+    for (int index = 0; index < argc; ++index) {
+      if (index > 0) {
+        appendBounded("\t", 1);
+      }
+      size_t length = 0;
+      const char* text = JS_ToCStringLen(context, &length, argv[index]);
+      if (text == nullptr) {
+        return JS_EXCEPTION;
+      }
+      try {
+        appendBounded(text, length);
+      } catch (...) {
+        JS_FreeCString(context, text);
+        throw;
+      }
+      JS_FreeCString(context, text);
     }
-    size_t length = 0;
-    const char* text = JS_ToCStringLen(context, &length, argv[index]);
-    if (text == nullptr) {
-      return JS_EXCEPTION;
+    if (truncated) {
+      self->outputTruncated_.store(true, std::memory_order_relaxed);
     }
-    appendBounded(text, length);
-    JS_FreeCString(context, text);
+    self->appendOutput(std::move(line));
+    return JS_UNDEFINED;
+  } catch (const std::bad_alloc&) {
+    return JS_ThrowOutOfMemory(context);
+  } catch (const std::exception& error) {
+    return JS_ThrowInternalError(context, "%s", error.what());
+  } catch (...) {
+    return JS_ThrowInternalError(
+        context, "Unknown console capture failure");
   }
-  if (truncated) {
-    self->outputTruncated_.store(true, std::memory_order_relaxed);
-  }
-  self->appendOutput(std::move(line));
-  return JS_UNDEFINED;
 }
 
 JSValue QuickJSContext::promiseHandledThunk(
@@ -1833,6 +1975,7 @@ ExecutionResult QuickJSContext::awaitValue(
         std::chrono::milliseconds(50),
         [&] {
           return !state->completions.empty() ||
+              state->completionQueueFailed ||
               !state->alive.load(std::memory_order_relaxed) ||
               runtime_.cancellationRequested();
         });
@@ -2295,8 +2438,9 @@ void QuickJSContext::appendOutput(std::string line) {
     line.resize(lineBudget);
     outputTruncated_.store(true, std::memory_order_relaxed);
   }
-  outputBytes_ += separatorBytes + line.size();
+  const std::size_t storedLineBytes = line.size();
   output_.push_back(std::move(line));
+  outputBytes_ += separatorBytes + storedLineBytes;
 }
 
 void QuickJSContext::releasePin() noexcept {

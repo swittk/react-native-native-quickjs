@@ -223,6 +223,65 @@ int main() {
   }
 
   {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+
+    const std::string syncName{"nul\0host", 8};
+    context->registerHostFunction(
+        syncName,
+        [](const std::vector<Value>&) -> Value { return Value{11}; });
+    auto syncNamed = context->evaluate(
+        "({"
+        "  full: globalThis['nul\\u0000host'](),"
+        "  truncated: typeof globalThis.nul"
+        "})",
+        "nul-sync-host-name.js");
+    check(
+        syncNamed.ok() && syncNamed.value.has_value() &&
+            number(object(*syncNamed.value).at("full")) == 11 &&
+            std::get<std::string>(
+                object(*syncNamed.value).at("truncated").data) == "undefined",
+        "sync host function names preserve embedded NUL characters");
+
+    const std::string asyncName{"async\0host", 10};
+    context->registerAsyncHostFunction(
+        asyncName,
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion complete) {
+          QuickJSContext::AsyncHostResult result;
+          result.value = Value{12};
+          complete(std::move(result));
+        });
+    auto asyncNamed = context->evaluateAwaited(
+        "({"
+        "  full: await globalThis['async\\u0000host'](),"
+        "  truncated: typeof globalThis.async"
+        "})",
+        "nul-async-host-name.js",
+        EvalMode::AsyncScript);
+    check(
+        asyncNamed.ok() && asyncNamed.value.has_value() &&
+            number(object(*asyncNamed.value).at("full")) == 12 &&
+            std::get<std::string>(
+                object(*asyncNamed.value).at("truncated").data) == "undefined",
+        "async host function names preserve embedded NUL characters");
+
+    auto retainSetup = context->evaluate(
+        "globalThis['ret\\u0000fn'] = () => 13;"
+        "globalThis.ret = () => 99;"
+        "void 0;",
+        "nul-retain-global-setup.js");
+    check(retainSetup.ok(), "embedded-NUL retained-global setup succeeds");
+    const std::string retainedName{"ret\0fn", 6};
+    const auto retainedHandle = context->retainGlobal(retainedName);
+    auto retainedResult = context->call(retainedHandle);
+    check(
+        retainedResult.ok() && retainedResult.value.has_value() &&
+            number(*retainedResult.value) == 13,
+        "retainGlobal preserves embedded NUL characters");
+    context->release(retainedHandle);
+  }
+
+  {
     RuntimeOptions options;
     options.executionLimitMs = 20;
     QuickJSRuntime runtime(options);

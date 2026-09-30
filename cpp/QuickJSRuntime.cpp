@@ -816,12 +816,24 @@ void QuickJSContext::registerHostFunction(
   }
 
   JSValue global = JS_GetGlobalObject(context_);
-  if (JS_DefinePropertyValueStr(
-          context_,
-          global,
-          name.c_str(),
-          functionValue,
-          JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+  JSAtom nameAtom = JS_NewAtomLen(context_, name.data(), name.size());
+  if (nameAtom == JS_ATOM_NULL) {
+    JS_FreeValue(context_, functionValue);
+    JS_FreeValue(context_, global);
+    hostFunctions_.erase(id);
+    const ErrorInfo error = takeExceptionInfo();
+    endExecution();
+    throw std::runtime_error(
+        error.message.empty() ? "Unable to create host function name" : error.message);
+  }
+  const int defineStatus = JS_DefinePropertyValue(
+      context_,
+      global,
+      nameAtom,
+      functionValue,
+      JS_PROP_C_W_E | JS_PROP_THROW);
+  JS_FreeAtom(context_, nameAtom);
+  if (defineStatus < 0) {
     JS_FreeValue(context_, global);
     hostFunctions_.erase(id);
     const ErrorInfo error = takeExceptionInfo();
@@ -868,12 +880,26 @@ void QuickJSContext::registerAsyncHostFunction(
   }
 
   JSValue global = JS_GetGlobalObject(context_);
-  if (JS_DefinePropertyValueStr(
-          context_,
-          global,
-          name.c_str(),
-          functionValue,
-          JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+  JSAtom nameAtom = JS_NewAtomLen(context_, name.data(), name.size());
+  if (nameAtom == JS_ATOM_NULL) {
+    JS_FreeValue(context_, functionValue);
+    JS_FreeValue(context_, global);
+    asyncHostFunctions_.erase(id);
+    const ErrorInfo error = takeExceptionInfo();
+    endExecution();
+    throw std::runtime_error(
+        error.message.empty()
+            ? "Unable to create async host function name"
+            : error.message);
+  }
+  const int defineStatus = JS_DefinePropertyValue(
+      context_,
+      global,
+      nameAtom,
+      functionValue,
+      JS_PROP_C_W_E | JS_PROP_THROW);
+  JS_FreeAtom(context_, nameAtom);
+  if (defineStatus < 0) {
     JS_FreeValue(context_, global);
     asyncHostFunctions_.erase(id);
     const ErrorInfo error = takeExceptionInfo();
@@ -895,7 +921,19 @@ std::uint64_t QuickJSContext::retainGlobal(const std::string& name) {
 
   beginExecution();
   JSValue global = JS_GetGlobalObject(context_);
-  JSValue value = JS_GetPropertyStr(context_, global, name.c_str());
+  JSAtom nameAtom = JS_NewAtomLen(context_, name.data(), name.size());
+  if (nameAtom == JS_ATOM_NULL) {
+    JS_FreeValue(context_, global);
+    ExecutionResult failure =
+        resultFromCurrentException(std::chrono::steady_clock::now());
+    endExecution();
+    throw QuickJSExecutionException(
+        std::move(failure.reason),
+        failure.code,
+        std::move(failure.error));
+  }
+  JSValue value = JS_GetProperty(context_, global, nameAtom);
+  JS_FreeAtom(context_, nameAtom);
   JS_FreeValue(context_, global);
   if (JS_IsException(value)) {
     ExecutionResult failure =

@@ -125,6 +125,10 @@ interface NativeQuickJSContext {
   dispose(): void;
 }
 
+interface NativeQuickJSWorkerTaskResult extends QuickJSWorkerResult {
+  taskId: number;
+}
+
 interface NativeQuickJSWorker {
   readonly valid: boolean;
   readonly executing: boolean;
@@ -133,6 +137,7 @@ interface NativeQuickJSWorker {
   startCall(handle: number, args?: QuickJSValue[]): number;
   startMemory(): number;
   takeTaskResult(taskId: number): QuickJSWorkerResult | null;
+  takeNextTaskResult(): NativeQuickJSWorkerTaskResult | null;
   release(handle: number): void;
   registerAsyncHostFunction(
     name: string,
@@ -328,29 +333,84 @@ function wrapContext(native: NativeQuickJSContext): QuickJSContext {
 
 const WORKER_POLL_INTERVAL_MS = 8;
 
-function awaitWorkerTask<T extends QuickJSValue = QuickJSValue>(
-  worker: NativeQuickJSWorker,
-  taskId: number
-): Promise<QuickJSWorkerResult<T>> {
-  return new Promise((resolve, reject) => {
-    const poll = (): void => {
-      try {
-        const result = worker.takeTaskResult(taskId);
-        if (result) {
-          resolve(result as QuickJSWorkerResult<T>);
-          return;
+interface PendingWorkerTask {
+  resolve(result: QuickJSWorkerResult): void;
+  reject(error: unknown): void;
+}
+
+function createWorkerTaskAwaiter(worker: NativeQuickJSWorker) {
+  const pending = new Map<number, PendingWorkerTask>();
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const rejectAll = (error: unknown): void => {
+    if (pollTimer !== undefined) {
+      clearTimeout(pollTimer);
+      pollTimer = undefined;
+    }
+    for (const waiter of pending.values()) {
+      waiter.reject(error);
+    }
+    pending.clear();
+  };
+
+  const poll = (): void => {
+    pollTimer = undefined;
+    try {
+      while (true) {
+        const result = worker.takeNextTaskResult();
+        if (!result) {
+          break;
         }
-        if (!worker.valid) {
-          reject(new Error('QuickJS worker was disposed before task completion.'));
-          return;
+        const waiter = pending.get(result.taskId);
+        if (waiter) {
+          pending.delete(result.taskId);
+          waiter.resolve(result);
         }
-        setTimeout(poll, WORKER_POLL_INTERVAL_MS);
-      } catch (error) {
-        reject(error);
       }
-    };
-    setTimeout(poll, 0);
-  });
+
+      if (pending.size === 0) {
+        return;
+      }
+      if (!worker.valid) {
+        rejectAll(
+          new Error('QuickJS worker was disposed before task completion.')
+        );
+        return;
+      }
+      pollTimer = setTimeout(poll, WORKER_POLL_INTERVAL_MS);
+    } catch (error) {
+      rejectAll(error);
+    }
+  };
+
+  const schedulePoll = (): void => {
+    if (pollTimer === undefined) {
+      pollTimer = setTimeout(poll, 0);
+    }
+  };
+
+  return {
+    wait<T extends QuickJSValue = QuickJSValue>(
+      taskId: number
+    ): Promise<QuickJSWorkerResult<T>> {
+      return new Promise((resolve, reject) => {
+        if (pending.has(taskId)) {
+          reject(new Error('QuickJS worker task is already being awaited.'));
+          return;
+        }
+        pending.set(taskId, {
+          resolve: result => resolve(result as QuickJSWorkerResult<T>),
+          reject,
+        });
+        schedulePoll();
+      });
+    },
+    dispose(): void {
+      rejectAll(
+        new Error('QuickJS worker was disposed before task completion.')
+      );
+    },
+  };
 }
 
 function throwWorkerResult(result: QuickJSWorkerResult): never {
@@ -399,6 +459,7 @@ export function createQuickJSWorker(
   }
 
   const native = globalThis.SKRNNativeQuickJSCreateWorker(options);
+  const taskAwaiter = createWorkerTaskAwaiter(native);
   return {
     get valid() {
       return native.valid;
@@ -410,8 +471,7 @@ export function createQuickJSWorker(
       source: string,
       options: QuickJSEvaluateOptions = {}
     ): Promise<QuickJSWorkerResult<T>> {
-      return awaitWorkerTask<T>(
-        native,
+      return taskAwaiter.wait<T>(
         native.startEvaluate(source, {
           ...options,
           mode: options.mode ?? 'async-script',
@@ -422,8 +482,7 @@ export function createQuickJSWorker(
       sourceOrGlobal: string,
       retainOptions?: QuickJSRetainOptions
     ): Promise<number> {
-      const result = await awaitWorkerTask(
-        native,
+      const result = await taskAwaiter.wait(
         native.startRetain(sourceOrGlobal, retainOptions)
       );
       if (result.reason !== 'ok') {
@@ -438,10 +497,10 @@ export function createQuickJSWorker(
       handle: number,
       args?: QuickJSValue[]
     ): Promise<QuickJSWorkerResult<T>> {
-      return awaitWorkerTask<T>(native, native.startCall(handle, args));
+      return taskAwaiter.wait<T>(native.startCall(handle, args));
     },
     async memoryAsync(): Promise<QuickJSMemoryStats> {
-      const result = await awaitWorkerTask(native, native.startMemory());
+      const result = await taskAwaiter.wait(native.startMemory());
       if (result.reason !== 'ok') {
         throwWorkerResult(result);
       }
@@ -449,8 +508,7 @@ export function createQuickJSWorker(
     },
     release: handle => native.release(handle),
     async registerAsyncHostFunction(name, callback): Promise<void> {
-      const result = await awaitWorkerTask(
-        native,
+      const result = await taskAwaiter.wait(
         native.registerAsyncHostFunction(name, callback)
       );
       if (result.reason !== 'ok') {
@@ -461,7 +519,13 @@ export function createQuickJSWorker(
     removeModule: name => native.removeModule(name),
     clearModules: () => native.clearModules(),
     cancel: () => native.cancel(),
-    dispose: () => native.dispose(),
+    dispose: () => {
+      try {
+        native.dispose();
+      } finally {
+        taskAwaiter.dispose();
+      }
+    },
   };
 }
 

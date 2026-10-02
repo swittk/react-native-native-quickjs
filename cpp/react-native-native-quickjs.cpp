@@ -1038,6 +1038,33 @@ class WorkerHostObject final : public jsi::HostObject,
       });
     }
 
+    if (property == "takeNextTaskResult") {
+      return makeFunction(runtime, "takeNextTaskResult", 0, [weakSelf](
+          jsi::Runtime& rt,
+          const jsi::Value&,
+          const jsi::Value*,
+          std::size_t) -> jsi::Value {
+        const auto self = weakSelf.lock();
+        if (!self) {
+          throw jsi::JSError(rt, "QuickJS worker is unavailable");
+        }
+        auto result = self->takeNextResult();
+        if (!result.has_value()) {
+          return jsi::Value::null();
+        }
+        auto object = resultToJSI(rt, result->result);
+        object.setProperty(
+            rt,
+            "taskId",
+            jsi::Value(static_cast<double>(result->taskId)));
+        object.setProperty(
+            rt,
+            "output",
+            jsi::String::createFromUtf8(rt, result->output));
+        return object;
+      });
+    }
+
     if (property == "release") {
       return makeFunction(runtime, "release", 1, [weakSelf](
           jsi::Runtime& rt,
@@ -1237,6 +1264,7 @@ class WorkerHostObject final : public jsi::HostObject,
         "startCall",
         "startMemory",
         "takeTaskResult",
+        "takeNextTaskResult",
         "release",
         "registerAsyncHostFunction",
         "addModule",
@@ -1420,6 +1448,23 @@ class WorkerHostObject final : public jsi::HostObject,
     }
     WorkerTaskResult result = std::move(*found);
     results_.erase(found);
+    if (!result.result.ok() &&
+        result.callbackToReleaseOnFailure != nullptr) {
+      releaseWorkerCallback(
+          callbackRegistry_, result.callbackToReleaseOnFailure);
+      result.callbackToReleaseOnFailure = nullptr;
+    }
+    outstandingTasks_.fetch_sub(1, std::memory_order_acq_rel);
+    return result;
+  }
+
+  std::optional<WorkerTaskResult> takeNextResult() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (results_.empty()) {
+      return std::nullopt;
+    }
+    WorkerTaskResult result = std::move(results_.front());
+    results_.pop_front();
     if (!result.result.ok() &&
         result.callbackToReleaseOnFailure != nullptr) {
       releaseWorkerCallback(

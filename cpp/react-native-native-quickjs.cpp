@@ -1261,6 +1261,15 @@ class WorkerHostObject final : public jsi::HostObject,
             } else {
               result = operation(quickjs, context);
 
+              // Some operations publish persistent native state before the
+              // task-boundary checkpoint runs. In particular, a successful
+              // host-function registration makes QuickJS retain a raw callback
+              // pointer. Commit that ownership now; a later microtask failure
+              // may change the task result, but must not free installed state.
+              if (result.ok() && callbackToReleaseOnFailure != nullptr) {
+                callbackToReleaseOnFailure = nullptr;
+              }
+
               // Worker tasks are task-isolated at the same-turn microtask
               // boundary. Low-level QuickJSContext calls keep their existing
               // behavior/performance; the worker pays only a cheap pending-job

@@ -338,6 +338,46 @@ int main() {
   {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
+
+    auto checkpointSetup = context->evaluate(
+        "Promise.resolve().then(() =>"
+        "  Promise.reject(new Error('registration-checkpoint')));"
+        "void 0;",
+        "registration-checkpoint-setup.js");
+    check(
+        checkpointSetup.ok(),
+        "registration checkpoint failure setup succeeds");
+
+    context->registerAsyncHostFunction(
+        "committedAsyncHost",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion complete) {
+          QuickJSContext::AsyncHostResult result;
+          result.value = Value{55};
+          complete(std::move(result));
+        });
+
+    auto registrationCheckpoint = context->executePendingJobs(
+        std::numeric_limits<std::size_t>::max(), false);
+    check(
+        !registrationCheckpoint.ok() &&
+            registrationCheckpoint.reason == "promise-rejection" &&
+            registrationCheckpoint.error.message == "registration-checkpoint",
+        "post-registration checkpoint can fail independently");
+
+    auto committedHostCall = context->evaluateAwaited(
+        "await committedAsyncHost()",
+        "committed-async-host-after-checkpoint.js",
+        EvalMode::AsyncScript);
+    check(
+        committedHostCall.ok() &&
+            committedHostCall.value.has_value() &&
+            number(*committedHostCall.value) == 55,
+        "successful async host registration survives later checkpoint failure");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
     const auto handle = context->retainEvaluation(
         "(value) => ({ doubled: value * 2 })", "callback.js");
     auto result = context->call(handle, {Value{21}});

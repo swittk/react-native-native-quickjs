@@ -1031,8 +1031,21 @@ std::uint64_t QuickJSContext::retainGlobal(const std::string& name) {
     throw std::runtime_error("Retained global is not a function");
   }
 
-  const std::uint64_t handle = nextHandle_++;
-  retained_.emplace(handle, value);
+  const std::uint64_t handle = nextHandle_;
+  bool published = false;
+  try {
+    const auto inserted = retained_.emplace(handle, value);
+    if (!inserted.second) {
+      throw std::runtime_error("Duplicate retained QuickJS handle");
+    }
+    published = true;
+  } catch (...) {
+    if (!published) {
+      JS_FreeValue(context_, value);
+    }
+    throw;
+  }
+  nextHandle_ += 1;
   return handle;
 }
 
@@ -1073,8 +1086,21 @@ std::uint64_t QuickJSContext::retainEvaluation(
     throw std::runtime_error("Retained evaluation did not produce a function");
   }
 
-  const std::uint64_t handle = nextHandle_++;
-  retained_.emplace(handle, value);
+  const std::uint64_t handle = nextHandle_;
+  bool published = false;
+  try {
+    const auto inserted = retained_.emplace(handle, value);
+    if (!inserted.second) {
+      throw std::runtime_error("Duplicate retained QuickJS handle");
+    }
+    published = true;
+  } catch (...) {
+    if (!published) {
+      JS_FreeValue(context_, value);
+    }
+    throw;
+  }
+  nextHandle_ += 1;
   return handle;
 }
 

@@ -838,6 +838,157 @@ int main() {
         context->queuedAsyncCompletionCount() == 0,
         "late completion after pending-promise cleanup is dropped");
 
+    QuickJSContext::AsyncHostCompletion completeOlderRequest;
+    context->registerAsyncHostFunction(
+        "olderRequest",
+        [&completeOlderRequest](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          completeOlderRequest = std::move(complete);
+        });
+    context->registerAsyncHostFunction(
+        "laterNever",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {});
+    auto olderRequestStarted = context->evaluate(
+        "globalThis.olderRequestValue = 0;"
+        "olderRequest().then(v => { globalThis.olderRequestValue = v; });"
+        "'started';",
+        "older-request-start.js");
+    check(
+        olderRequestStarted.ok() &&
+            static_cast<bool>(completeOlderRequest) &&
+            context->pendingAsyncCount() == 1,
+        "older Script-mode async request remains pending");
+    auto unrelatedPending = context->evaluate(
+        "await laterNever(); 1",
+        "unrelated-pending.js",
+        EvalMode::AsyncScript);
+    check(
+        !unrelatedPending.ok() &&
+            unrelatedPending.reason == "pending-promise" &&
+            context->pendingAsyncCount() == 1,
+        "later pending-promise cleanup preserves older request scope");
+    QuickJSContext::AsyncHostResult olderCompletion;
+    olderCompletion.value = Value{77};
+    completeOlderRequest(std::move(olderCompletion));
+    auto olderPump = context->executePendingJobs(
+        std::numeric_limits<std::size_t>::max(), false);
+    auto olderValue = context->evaluate(
+        "globalThis.olderRequestValue",
+        "older-request-check.js");
+    check(
+        olderPump.ok() &&
+            olderValue.ok() &&
+            olderValue.value.has_value() &&
+            number(*olderValue.value) == 77,
+        "older request still settles after unrelated pending-promise");
+
+    QuickJSContext::AsyncHostCompletion completeNestedRequest;
+    context->registerAsyncHostFunction(
+        "nestedRequest",
+        [&completeNestedRequest](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          completeNestedRequest = std::move(complete);
+        });
+    context->registerAsyncHostFunction(
+        "outerNever",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {});
+    context->registerHostFunction(
+        "startNestedRequest",
+        [&context](const std::vector<Value>&) -> Value {
+          auto nested = context->evaluate(
+              "globalThis.nestedRequestValue = 0;"
+              "nestedRequest().then(v => { globalThis.nestedRequestValue = v; });"
+              "'nested-started';",
+              "nested-request-start.js");
+          if (!nested.ok()) {
+            throw std::runtime_error("nested request setup failed");
+          }
+          return Value{true};
+        });
+    auto outerPending = context->evaluate(
+        "startNestedRequest(); await outerNever(); 1",
+        "outer-pending-with-nested.js",
+        EvalMode::AsyncScript);
+    check(
+        !outerPending.ok() &&
+            outerPending.reason == "pending-promise" &&
+            static_cast<bool>(completeNestedRequest) &&
+            context->pendingAsyncCount() == 1,
+        "outer pending-promise cleanup preserves nested request scope");
+    QuickJSContext::AsyncHostResult nestedCompletion;
+    nestedCompletion.value = Value{91};
+    completeNestedRequest(std::move(nestedCompletion));
+    auto nestedPump = context->executePendingJobs(
+        std::numeric_limits<std::size_t>::max(), false);
+    auto nestedValue = context->evaluate(
+        "globalThis.nestedRequestValue",
+        "nested-request-check.js");
+    check(
+        nestedPump.ok() &&
+            nestedValue.ok() &&
+            nestedValue.value.has_value() &&
+            number(*nestedValue.value) == 91,
+        "nested request survives outer call cleanup and settles later");
+
+    QuickJSContext::AsyncHostCompletion completeBadBatch;
+    QuickJSContext::AsyncHostCompletion completeGoodBatch;
+    context->registerAsyncHostFunction(
+        "badBatchRequest",
+        [&completeBadBatch](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          completeBadBatch = std::move(complete);
+        });
+    context->registerAsyncHostFunction(
+        "goodBatchRequest",
+        [&completeGoodBatch](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          completeGoodBatch = std::move(complete);
+        });
+    auto batchSetup = context->evaluate(
+        "globalThis.goodBatchValue = 0;"
+        "badBatchRequest();"
+        "goodBatchRequest().then(v => { globalThis.goodBatchValue = v; });"
+        "'batch-started';",
+        "completion-batch-setup.js");
+    check(
+        batchSetup.ok() &&
+            static_cast<bool>(completeBadBatch) &&
+            static_cast<bool>(completeGoodBatch),
+        "completion batch regression setup succeeds");
+    Value batchTooDeep{1};
+    for (int depth = 0; depth < 40; ++depth) {
+      batchTooDeep = Value{Value::Array{std::move(batchTooDeep)}};
+    }
+    QuickJSContext::AsyncHostResult badBatchResult;
+    badBatchResult.value = std::move(batchTooDeep);
+    completeBadBatch(std::move(badBatchResult));
+    QuickJSContext::AsyncHostResult goodBatchResult;
+    goodBatchResult.value = Value{88};
+    completeGoodBatch(std::move(goodBatchResult));
+    auto firstBatchPump = context->executePendingJobs(
+        std::numeric_limits<std::size_t>::max(), false);
+    check(
+        !firstBatchPump.ok() &&
+            firstBatchPump.reason == "value-conversion" &&
+            context->queuedAsyncCompletionCount() == 1 &&
+            context->pendingAsyncCount() == 1,
+        "failed completion requeues later completions instead of dropping them");
+    auto secondBatchPump = context->executePendingJobs(
+        std::numeric_limits<std::size_t>::max(), false);
+    auto goodBatchValue = context->evaluate(
+        "globalThis.goodBatchValue",
+        "completion-batch-check.js");
+    check(
+        secondBatchPump.ok() &&
+            goodBatchValue.ok() &&
+            goodBatchValue.value.has_value() &&
+            number(*goodBatchValue.value) == 88,
+        "requeued completion settles on the next pump");
+
     context->registerAsyncHostFunction(
         "neverCompleteFlood",
         [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {});

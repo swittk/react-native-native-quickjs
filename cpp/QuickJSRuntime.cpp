@@ -203,8 +203,15 @@ std::string boundedOwnDataStringProperty(
   }
 
   std::string result;
-  if ((descriptor.flags & JS_PROP_GETSET) == 0) {
-    result = boundedStringValue(context, descriptor.value, maxBytes);
+  try {
+    if ((descriptor.flags & JS_PROP_GETSET) == 0) {
+      result = boundedStringValue(context, descriptor.value, maxBytes);
+    }
+  } catch (...) {
+    JS_FreeValue(context, descriptor.value);
+    JS_FreeValue(context, descriptor.getter);
+    JS_FreeValue(context, descriptor.setter);
+    throw;
   }
   JS_FreeValue(context, descriptor.value);
   JS_FreeValue(context, descriptor.getter);
@@ -430,93 +437,112 @@ void QuickJSRuntime::promiseRejectionTracker(
     JSValueConst reason,
     int isHandled,
     void* opaque) {
-  auto* runtime = static_cast<QuickJSRuntime*>(opaque);
-  if (runtime == nullptr || context == nullptr || !JS_IsObject(promise)) {
-    return;
-  }
+  try {
 
-  const void* identity = JS_VALUE_GET_PTR(promise);
-  if (identity == nullptr) {
-    return;
-  }
-
-  if (isHandled) {
-    std::lock_guard<std::mutex> lock(runtime->rejectionMutex_);
-    runtime->unhandledRejections_.erase(identity);
-    return;
-  }
-
-  // Promise rejection tracking must never invoke guest getters or toString.
-  // Capture only primitive strings and own data-string properties from Error
-  // objects, and bound every host-side allocation.
-  ErrorInfo error;
-  if (JS_IsError(context, reason)) {
-    error.name = boundedOwnDataStringProperty(
-        context, reason, "name", kMaxUnhandledRejectionFieldBytes);
-    error.message = boundedOwnDataStringProperty(
-        context, reason, "message", kMaxUnhandledRejectionFieldBytes);
-    error.stack = boundedOwnDataStringProperty(
-        context, reason, "stack", kMaxUnhandledRejectionFieldBytes);
-    if (error.name.empty()) {
-      error.name = "Error";
+    auto* runtime = static_cast<QuickJSRuntime*>(opaque);
+    if (runtime == nullptr || context == nullptr || !JS_IsObject(promise)) {
+      return;
     }
-  } else if (JS_IsString(reason)) {
-    error.name = "UnhandledPromiseRejection";
-    error.message = boundedStringValue(
-        context, reason, kMaxUnhandledRejectionFieldBytes);
-  } else {
-    error.name = "UnhandledPromiseRejection";
-  }
-  if (error.message.empty()) {
-    error.message = "Unhandled promise rejection";
-  }
 
-  std::lock_guard<std::mutex> lock(runtime->rejectionMutex_);
-  const auto found = runtime->unhandledRejections_.find(identity);
-  if (found == runtime->unhandledRejections_.end() &&
-      runtime->unhandledRejections_.size() >= kMaxUnhandledRejections) {
-    runtime->unhandledRejectionOverflowContexts_.insert(context);
+    const void* identity = JS_VALUE_GET_PTR(promise);
+    if (identity == nullptr) {
+      return;
+    }
+
+    if (isHandled) {
+      std::lock_guard<std::mutex> lock(runtime->rejectionMutex_);
+      runtime->unhandledRejections_.erase(identity);
+      return;
+    }
+
+    // Promise rejection tracking must never invoke guest getters or toString.
+    // Capture only primitive strings and own data-string properties from Error
+    // objects, and bound every host-side allocation.
+    ErrorInfo error;
+    if (JS_IsError(context, reason)) {
+      error.name = boundedOwnDataStringProperty(
+          context, reason, "name", kMaxUnhandledRejectionFieldBytes);
+      error.message = boundedOwnDataStringProperty(
+          context, reason, "message", kMaxUnhandledRejectionFieldBytes);
+      error.stack = boundedOwnDataStringProperty(
+          context, reason, "stack", kMaxUnhandledRejectionFieldBytes);
+      if (error.name.empty()) {
+        error.name = "Error";
+      }
+    } else if (JS_IsString(reason)) {
+      error.name = "UnhandledPromiseRejection";
+      error.message = boundedStringValue(
+          context, reason, kMaxUnhandledRejectionFieldBytes);
+    } else {
+      error.name = "UnhandledPromiseRejection";
+    }
+    if (error.message.empty()) {
+      error.message = "Unhandled promise rejection";
+    }
+
+    std::lock_guard<std::mutex> lock(runtime->rejectionMutex_);
+    const auto found = runtime->unhandledRejections_.find(identity);
+    if (found == runtime->unhandledRejections_.end() &&
+        runtime->unhandledRejections_.size() >= kMaxUnhandledRejections) {
+      runtime->unhandledRejectionOverflowContexts_.insert(context);
+      return;
+    }
+    runtime->unhandledRejections_[identity] =
+        UnhandledRejectionRecord{context, std::move(error)};
+  } catch (...) {
+    // This is a QuickJS C callback. Never let host allocation/locking
+    // failures unwind across the C ABI; rejection tracking is diagnostic.
     return;
   }
-  runtime->unhandledRejections_[identity] =
-      UnhandledRejectionRecord{context, std::move(error)};
 }
 
 JSModuleDef* QuickJSRuntime::moduleLoader(
     JSContext* context,
     const char* moduleName,
     void* opaque) {
-  auto* runtime = static_cast<QuickJSRuntime*>(opaque);
-  if (runtime == nullptr || moduleName == nullptr) {
-    JS_ThrowReferenceError(context, "Module loader is unavailable");
-    return nullptr;
-  }
+  try {
 
-  std::string source;
-  {
-    std::lock_guard<std::mutex> lock(runtime->moduleMutex_);
-    const auto found = runtime->modules_.find(moduleName);
-    if (found == runtime->modules_.end()) {
-      JS_ThrowReferenceError(
-          context, "Module '%s' is not available in this runtime", moduleName);
+    auto* runtime = static_cast<QuickJSRuntime*>(opaque);
+    if (runtime == nullptr || moduleName == nullptr) {
+      JS_ThrowReferenceError(context, "Module loader is unavailable");
       return nullptr;
     }
-    source = found->second;
-  }
 
-  JSValue compiled = JS_Eval(
-      context,
-      source.data(),
-      source.size(),
-      moduleName,
-      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-  if (JS_IsException(compiled)) {
+    std::string source;
+    {
+      std::lock_guard<std::mutex> lock(runtime->moduleMutex_);
+      const auto found = runtime->modules_.find(moduleName);
+      if (found == runtime->modules_.end()) {
+        JS_ThrowReferenceError(
+            context, "Module '%s' is not available in this runtime", moduleName);
+        return nullptr;
+      }
+      source = found->second;
+    }
+
+    JSValue compiled = JS_Eval(
+        context,
+        source.data(),
+        source.size(),
+        moduleName,
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(compiled)) {
+      return nullptr;
+    }
+
+    auto* module = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(compiled));
+    JS_FreeValue(context, compiled);
+    return module;
+  } catch (const std::bad_alloc&) {
+    JS_ThrowOutOfMemory(context);
+    return nullptr;
+  } catch (const std::exception& error) {
+    JS_ThrowInternalError(context, "%s", error.what());
+    return nullptr;
+  } catch (...) {
+    JS_ThrowInternalError(context, "Unknown module loader failure");
     return nullptr;
   }
-
-  auto* module = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(compiled));
-  JS_FreeValue(context, compiled);
-  return module;
 }
 
 void QuickJSRuntime::beginExecution() noexcept {
@@ -765,6 +791,7 @@ ExecutionResult QuickJSContext::evaluate(
     return result;
   }
 
+  AsyncRequestScope requestScope(*this);
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
   JSValue value = JS_Eval(
@@ -816,6 +843,7 @@ ExecutionResult QuickJSContext::evaluateAwaited(
     return result;
   }
 
+  AsyncRequestScope requestScope(*this);
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
   JSValue value = JS_Eval(
@@ -968,6 +996,7 @@ std::uint64_t QuickJSContext::retainGlobal(const std::string& name) {
     throw std::runtime_error("QuickJS context is disposed");
   }
   ContextPin pin(*this);
+  AsyncRequestScope requestScope(*this);
 
   beginExecution();
   JSValue global = JS_GetGlobalObject(context_);
@@ -1017,6 +1046,7 @@ std::uint64_t QuickJSContext::retainEvaluation(
         "QuickJS filename cannot contain embedded NUL characters");
   }
   ContextPin pin(*this);
+  AsyncRequestScope requestScope(*this);
 
   beginExecution();
   JSValue value = JS_Eval(
@@ -1069,6 +1099,7 @@ ExecutionResult QuickJSContext::call(
     return result;
   }
 
+  AsyncRequestScope requestScope(*this);
   std::vector<JSValue> jsArgs;
   jsArgs.reserve(args.size());
   try {
@@ -1128,6 +1159,7 @@ ExecutionResult QuickJSContext::callAwaited(
     return result;
   }
 
+  AsyncRequestScope requestScope(*this);
   std::vector<JSValue> jsArgs;
   jsArgs.reserve(args.size());
   try {
@@ -1259,9 +1291,16 @@ ExecutionResult QuickJSContext::executePendingJobs(
     return result;
   }
   ContextPin pin(*this);
+  AsyncRequestScope requestScope(*this);
 
   processAsyncCompletions();
   if (auto failure = takeAsyncCompletionFailure()) {
+    if (failure->reason == "cancelled" ||
+        runtime_.cancellationRequested()) {
+      clearPendingAsyncPromises();
+    } else {
+      clearPendingAsyncPromisesForScope(requestScope.id());
+    }
     failure->durationMs = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started)
                               .count();
@@ -1274,6 +1313,14 @@ ExecutionResult QuickJSContext::executePendingJobs(
   ExecutionResult result = drainPendingJobsInCurrentTurn(
       started, maxJobs, collectSuccessMemory);
   endExecution();
+  if (!result.ok()) {
+    if (result.reason == "cancelled" ||
+        runtime_.cancellationRequested()) {
+      clearPendingAsyncPromises();
+    } else {
+      clearPendingAsyncPromisesForScope(requestScope.id());
+    }
+  }
   return result;
 }
 
@@ -1306,11 +1353,15 @@ std::size_t QuickJSContext::processAsyncCompletions() {
   }
 
   std::size_t processed = 0;
+  bool interruptedBatch = false;
   beginExecution();
-  for (auto& completion : completions) {
+  while (!completions.empty()) {
     if (!isOpen()) {
       break;
     }
+
+    QueuedAsyncCompletion completion = std::move(completions.front());
+    completions.pop_front();
 
     const auto found = pendingPromises_.find(completion.requestId);
     if (found == pendingPromises_.end()) {
@@ -1428,14 +1479,34 @@ std::size_t QuickJSContext::processAsyncCompletions() {
     ++processed;
 
     if (interrupted) {
+      interruptedBatch = true;
       break;
     }
   }
   endExecution();
 
-  if (asyncCompletionFailure_) {
-    clearPendingAsyncPromises();
+  if (interruptedBatch && !completions.empty() && asyncState_) {
+    try {
+      std::lock_guard<std::mutex> lock(asyncState_->mutex);
+      // These completions were observed before any completions that arrived
+      // while this batch was running, so prepend them in their original order.
+      while (!completions.empty()) {
+        asyncState_->completions.push_front(
+            std::move(completions.back()));
+        completions.pop_back();
+      }
+    } catch (...) {
+      // Requeue allocation failure is a host-side async transport failure.
+      // Surface it on the next pump rather than unwinding through QuickJS.
+      try {
+        std::lock_guard<std::mutex> lock(asyncState_->mutex);
+        asyncState_->completionQueueFailed = true;
+      } catch (...) {
+      }
+      asyncState_->activity.notify_all();
+    }
   }
+
   return processed;
 }
 
@@ -1470,6 +1541,58 @@ void QuickJSContext::clearPendingAsyncPromises() noexcept {
     asyncState_->activeRequests.clear();
     asyncState_->completions.clear();
     asyncState_->completionQueueFailed = false;
+  }
+}
+
+void QuickJSContext::clearPendingAsyncPromisesForScope(
+    std::uint64_t scopeId) noexcept {
+  if (scopeId == 0) {
+    return;
+  }
+
+  if (asyncState_) {
+    try {
+      std::lock_guard<std::mutex> lock(asyncState_->mutex);
+
+      for (auto found = asyncState_->activeRequests.begin();
+           found != asyncState_->activeRequests.end();) {
+        const auto pending = pendingPromises_.find(*found);
+        if (pending != pendingPromises_.end() &&
+            pending->second.scopeId == scopeId) {
+          found = asyncState_->activeRequests.erase(found);
+        } else {
+          ++found;
+        }
+      }
+
+      for (auto found = asyncState_->completions.begin();
+           found != asyncState_->completions.end();) {
+        const auto pending = pendingPromises_.find(found->requestId);
+        if (pending != pendingPromises_.end() &&
+            pending->second.scopeId == scopeId) {
+          found = asyncState_->completions.erase(found);
+        } else {
+          ++found;
+        }
+      }
+    } catch (...) {
+      // Best-effort failure cleanup. Pending resolver ownership below is
+      // authoritative; stale host completions are ignored when no resolver
+      // remains for their request id.
+    }
+  }
+
+  for (auto found = pendingPromises_.begin();
+       found != pendingPromises_.end();) {
+    if (found->second.scopeId != scopeId) {
+      ++found;
+      continue;
+    }
+    if (context_ != nullptr) {
+      JS_FreeValue(context_, found->second.resolve);
+      JS_FreeValue(context_, found->second.reject);
+    }
+    found = pendingPromises_.erase(found);
   }
 }
 
@@ -1758,7 +1881,10 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
   try {
     const auto pending = self->pendingPromises_.emplace(
         requestId,
-        PendingPromise{resolving[0], resolving[1]});
+        PendingPromise{
+            resolving[0],
+            resolving[1],
+            self->activeAsyncRequestScopeId_});
     if (!pending.second) {
       rollbackSetup();
       return JS_ThrowInternalError(
@@ -1988,6 +2114,7 @@ ExecutionResult QuickJSContext::awaitValue(
     JSValue value,
     std::chrono::steady_clock::time_point started,
     bool waitForAsyncCompletions) {
+  const std::uint64_t requestScopeId = activeAsyncRequestScopeId_;
   const int initialPromiseState =
       JS_IsObject(value) ? static_cast<int>(JS_PromiseState(context_, value)) : -1;
   if (initialPromiseState < 0) {
@@ -2002,6 +2129,7 @@ ExecutionResult QuickJSContext::awaitValue(
   endExecution();
   if (!handled) {
     JS_FreeValue(context_, value);
+    clearPendingAsyncPromisesForScope(requestScopeId);
     ExecutionResult result;
     result.reason = "runtime";
     result.code = 1;
@@ -2036,7 +2164,12 @@ ExecutionResult QuickJSContext::awaitValue(
     processAsyncCompletions();
     if (auto failure = takeAsyncCompletionFailure()) {
       JS_FreeValue(context_, value);
-      clearPendingAsyncPromises();
+      if (failure->reason == "cancelled" ||
+          runtime_.cancellationRequested()) {
+        clearPendingAsyncPromises();
+      } else {
+        clearPendingAsyncPromisesForScope(requestScopeId);
+      }
       failure->durationMs = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - started)
                                 .count();
@@ -2054,7 +2187,12 @@ ExecutionResult QuickJSContext::awaitValue(
       endExecution();
       if (!jobs.ok()) {
         JS_FreeValue(context_, value);
-        clearPendingAsyncPromises();
+        if (jobs.reason == "cancelled" ||
+            runtime_.cancellationRequested()) {
+          clearPendingAsyncPromises();
+        } else {
+          clearPendingAsyncPromisesForScope(requestScopeId);
+        }
         return jobs;
       }
       continue;
@@ -2066,7 +2204,7 @@ ExecutionResult QuickJSContext::awaitValue(
 
     if (!waitForAsyncCompletions) {
       JS_FreeValue(context_, value);
-      clearPendingAsyncPromises();
+      clearPendingAsyncPromisesForScope(requestScopeId);
       ExecutionResult result;
       result.reason = "pending-promise";
       result.code = 1011;

@@ -243,6 +243,7 @@ class QuickJSContext final {
   ErrorInfo errorFromValue(JSValueConst value);
   JSValue errorToJSValue(const ErrorInfo& error);
   void clearPendingAsyncPromises() noexcept;
+  void clearPendingAsyncPromisesForScope(std::uint64_t scopeId) noexcept;
   bool markPromiseHandled(JSValueConst promise);
   std::optional<ExecutionResult> takeAsyncCompletionFailure();
   ExecutionResult drainPendingJobsInCurrentTurn(
@@ -252,6 +253,29 @@ class QuickJSContext final {
 
   Value fromJSValue(JSValue value, int depth = 0, std::size_t* nodeCount = nullptr);
   JSValue toJSValue(const Value& value, int depth = 0, std::size_t* nodeCount = nullptr);
+
+  class AsyncRequestScope final {
+   public:
+    explicit AsyncRequestScope(QuickJSContext& context) noexcept
+        : context_(context),
+          previousScopeId_(context.activeAsyncRequestScopeId_),
+          scopeId_(context.nextAsyncRequestScopeId_++) {
+      context_.activeAsyncRequestScopeId_ = scopeId_;
+    }
+    ~AsyncRequestScope() {
+      context_.activeAsyncRequestScopeId_ = previousScopeId_;
+    }
+
+    AsyncRequestScope(const AsyncRequestScope&) = delete;
+    AsyncRequestScope& operator=(const AsyncRequestScope&) = delete;
+
+    std::uint64_t id() const noexcept { return scopeId_; }
+
+   private:
+    QuickJSContext& context_;
+    std::uint64_t previousScopeId_ = 0;
+    std::uint64_t scopeId_ = 0;
+  };
 
   class ContextPin final {
    public:
@@ -280,6 +304,7 @@ class QuickJSContext final {
   struct PendingPromise {
     JSValue resolve = JS_UNDEFINED;
     JSValue reject = JS_UNDEFINED;
+    std::uint64_t scopeId = 0;
   };
   struct AsyncState {
     std::atomic<bool> alive{true};
@@ -299,6 +324,8 @@ class QuickJSContext final {
   std::shared_ptr<AsyncState> asyncState_;
   std::uint64_t nextHandle_ = 1;
   std::uint64_t nextAsyncRequestId_ = 1;
+  std::uint64_t nextAsyncRequestScopeId_ = 1;
+  std::uint64_t activeAsyncRequestScopeId_ = 0;
   int nextHostFunctionId_ = 1;
   int nextAsyncHostFunctionId_ = 1;
   std::size_t executionDepth_ = 0;

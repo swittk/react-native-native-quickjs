@@ -940,7 +940,7 @@ class WorkerHostObject final : public jsi::HostObject,
           result.memory = quickjs.resultMemoryStats();
           result.outputTruncated = context.outputWasTruncated();
           return result;
-        });
+        }, nullptr, true);
         return jsi::Value(static_cast<double>(taskId));
       });
     }
@@ -1253,7 +1253,8 @@ class WorkerHostObject final : public jsi::HostObject,
       std::function<rnquickjs::ExecutionResult(
           rnquickjs::QuickJSRuntime&,
           rnquickjs::QuickJSContext&)> operation,
-      jsi::Function* callbackToReleaseOnFailure = nullptr) {
+      jsi::Function* callbackToReleaseOnFailure = nullptr,
+      bool rollbackReturnedHandleOnFailure = false) {
     const auto previousOutstanding =
         outstandingTasks_.fetch_add(1, std::memory_order_acq_rel);
     if (previousOutstanding >= kMaxWorkerOutstandingTasks) {
@@ -1272,6 +1273,7 @@ class WorkerHostObject final : public jsi::HostObject,
           taskId,
           cancellationGeneration,
           callbackToReleaseOnFailure,
+          rollbackReturnedHandleOnFailure,
           operation = std::move(operation)](
               rnquickjs::QuickJSRuntime& quickjs,
               rnquickjs::QuickJSContext& context) mutable {
@@ -1314,6 +1316,21 @@ class WorkerHostObject final : public jsi::HostObject,
             } else {
               result = operation(quickjs, context);
 
+              std::optional<std::uint64_t> returnedHandleToRollback;
+              if (rollbackReturnedHandleOnFailure &&
+                  result.ok() &&
+                  result.value.has_value()) {
+                if (const auto* value =
+                        std::get_if<double>(&result.value->data);
+                    value != nullptr &&
+                    *value >= 1 &&
+                    std::isfinite(*value) &&
+                    std::floor(*value) == *value) {
+                  returnedHandleToRollback =
+                      static_cast<std::uint64_t>(*value);
+                }
+              }
+
               // Some operations publish persistent native state before the
               // task-boundary checkpoint runs. In particular, a successful
               // host-function registration makes QuickJS retain a raw callback
@@ -1333,6 +1350,9 @@ class WorkerHostObject final : public jsi::HostObject,
                 if (result.ok() && !jobs.ok()) {
                   result = std::move(jobs);
                 }
+              }
+              if (!result.ok() && returnedHandleToRollback.has_value()) {
+                context.release(*returnedHandleToRollback);
               }
               result.outputTruncated = context.outputWasTruncated();
             }

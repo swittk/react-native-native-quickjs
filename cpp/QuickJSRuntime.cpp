@@ -282,6 +282,10 @@ void QuickJSRuntime::addModule(std::string name, std::string source) {
   if (name.empty()) {
     throw std::invalid_argument("Module name cannot be empty");
   }
+  if (name.find('\0') != std::string::npos) {
+    throw std::invalid_argument(
+        "Module name cannot contain embedded NUL characters");
+  }
   std::lock_guard<std::mutex> lock(moduleMutex_);
   modules_[std::move(name)] = std::move(source);
 }

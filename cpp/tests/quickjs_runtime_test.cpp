@@ -1613,8 +1613,50 @@ int main() {
 
   {
     QuickJSRuntime runtime;
+    bool nulModuleRejected = false;
+    try {
+      runtime.addModule(
+          std::string{"a\0b", 3},
+          "export default 99;");
+    } catch (const std::invalid_argument&) {
+      nulModuleRejected = true;
+    }
+    check(
+        nulModuleRejected,
+        "host module names reject embedded NUL characters");
+
+    runtime.addModule("a", "export default 41;");
     runtime.addModule("math", "export const answer = 42;");
     auto context = runtime.createContext();
+
+    auto nulStaticImport = context->evaluate(
+        "import value from 'a\\u0000b';"
+        "globalThis.nulStaticAlias = value;",
+        "nul-static-import.mjs",
+        EvalMode::Module);
+    check(
+        !nulStaticImport.ok() &&
+            nulStaticImport.reason == "module-denied",
+        "static import specifiers with embedded NUL do not alias host modules");
+
+    auto plainAImport = context->evaluate(
+        "import value from 'a'; globalThis.plainAModule = value;",
+        "plain-a-import.mjs",
+        EvalMode::Module);
+    check(
+        plainAImport.ok(),
+        "ordinary module name remains loadable after NUL guard");
+
+    auto dynamicNulImport = context->evaluateAwaited(
+        "await import('a\\u0000b'); 1;",
+        "nul-dynamic-import.js",
+        EvalMode::AsyncScript);
+    check(
+        !dynamicNulImport.ok() &&
+            dynamicNulImport.error.message.find(
+                "not available in this runtime") != std::string::npos,
+        "dynamic import specifiers with embedded NUL do not alias host modules");
+
     auto allowed = context->evaluate(
         "import { answer } from 'math'; globalThis.moduleAnswer = answer;",
         "entry.mjs",

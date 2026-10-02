@@ -390,6 +390,22 @@ std::string requiredString(
   return arguments[index].asString(runtime).utf8(runtime);
 }
 
+std::string requiredModuleName(
+    jsi::Runtime& runtime,
+    const jsi::Value* arguments,
+    std::size_t count,
+    std::size_t index) {
+  auto name = requiredString(runtime, arguments, count, index, "Module name");
+  if (name.empty()) {
+    throw jsi::JSError(runtime, "Module name cannot be empty");
+  }
+  if (name.find('\0') != std::string::npos) {
+    throw jsi::JSError(
+        runtime, "Module name cannot contain embedded NUL characters");
+  }
+  return name;
+}
+
 std::uint64_t requiredHandle(
     jsi::Runtime& runtime,
     const jsi::Value* arguments,
@@ -1082,12 +1098,9 @@ class WorkerHostObject final : public jsi::HostObject,
           throw jsi::JSError(rt, "QuickJS worker is unavailable");
         }
         const auto moduleName =
-            requiredString(rt, args, count, 0, "Module name");
+            requiredModuleName(rt, args, count, 0);
         const auto source =
             requiredString(rt, args, count, 1, "Module source");
-        if (moduleName.empty()) {
-          throw jsi::JSError(rt, "Module name cannot be empty");
-        }
         self->enqueue([
             moduleName,
             source](
@@ -1110,7 +1123,7 @@ class WorkerHostObject final : public jsi::HostObject,
           throw jsi::JSError(rt, "QuickJS worker is unavailable");
         }
         const auto moduleName =
-            requiredString(rt, args, count, 0, "Module name");
+            requiredModuleName(rt, args, count, 0);
         self->enqueue([moduleName](
             rnquickjs::QuickJSRuntime& quickjs,
             rnquickjs::QuickJSContext&) {
@@ -1696,7 +1709,7 @@ jsi::Value RuntimeHostObject::get(
         throw jsi::JSError(rt, "QuickJS runtime is unavailable");
       }
       self->requireRuntime(rt).addModule(
-          requiredString(rt, args, count, 0, "Module name"),
+          requiredModuleName(rt, args, count, 0),
           requiredString(rt, args, count, 1, "Module source"));
       return jsi::Value::undefined();
     });
@@ -1711,7 +1724,7 @@ jsi::Value RuntimeHostObject::get(
       }
       auto& quickjs = self->requireRuntime(rt);
       if (property == "removeModule") {
-        quickjs.removeModule(requiredString(rt, args, count, 0, "Module name"));
+        quickjs.removeModule(requiredModuleName(rt, args, count, 0));
       } else {
         quickjs.clearModules();
       }

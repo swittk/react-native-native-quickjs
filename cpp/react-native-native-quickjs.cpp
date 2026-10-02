@@ -563,6 +563,19 @@ void releaseWorkerCallback(
   }
 }
 
+void setErrorInfoBestEffort(
+    rnquickjs::ErrorInfo& error,
+    const char* name,
+    const char* message) noexcept {
+  try {
+    error.name = name;
+    error.message = message;
+  } catch (...) {
+    // Error reporting must never prevent the cross-runtime Promise from
+    // settling. Empty fields are handled by QuickJS error conversion.
+  }
+}
+
 rnquickjs::ErrorInfo errorFromJSI(
     jsi::Runtime& runtime,
     const jsi::Value& value) {
@@ -684,8 +697,14 @@ void invokeAsyncOnJSThread(
                       count == 0 ? rnquickjs::Value{} : fromJSI(rt, args[0]);
                 } catch (const std::exception& error) {
                   settled.ok = false;
-                  settled.error.name = "HostValueError";
-                  settled.error.message = error.what();
+                  setErrorInfoBestEffort(
+                      settled.error, "HostValueError", error.what());
+                } catch (...) {
+                  settled.ok = false;
+                  setErrorInfoBestEffort(
+                      settled.error,
+                      "HostValueError",
+                      "Unknown host value conversion failure");
                 }
                 completeOnce(std::move(settled));
                 return jsi::Value::undefined();
@@ -701,9 +720,17 @@ void invokeAsyncOnJSThread(
                   std::size_t count) mutable -> jsi::Value {
                 rnquickjs::QuickJSContext::AsyncHostResult settled;
                 settled.ok = false;
-                settled.error = count == 0
-                    ? rnquickjs::ErrorInfo{"Error", "Host Promise rejected", ""}
-                    : errorFromJSI(rt, args[0]);
+                if (count == 0) {
+                  setErrorInfoBestEffort(
+                      settled.error, "Error", "Host Promise rejected");
+                } else {
+                  try {
+                    settled.error = errorFromJSI(rt, args[0]);
+                  } catch (...) {
+                    setErrorInfoBestEffort(
+                        settled.error, "Error", "Host Promise rejected");
+                  }
+                }
                 completeOnce(std::move(settled));
                 return jsi::Value::undefined();
               });
@@ -723,16 +750,18 @@ void invokeAsyncOnJSThread(
     } catch (const std::exception& error) {
       rnquickjs::QuickJSContext::AsyncHostResult settled;
       settled.ok = false;
-      settled.error.name = "HostError";
-      settled.error.message = error.what();
+      setErrorInfoBestEffort(
+          settled.error, "HostError", error.what());
       completeOnce(std::move(settled));
-      } catch (...) {
-        rnquickjs::QuickJSContext::AsyncHostResult settled;
-        settled.ok = false;
-        settled.error.name = "HostError";
-        settled.error.message = "Unknown host async callback failure";
-        completeOnce(std::move(settled));
-      }
+    } catch (...) {
+      rnquickjs::QuickJSContext::AsyncHostResult settled;
+      settled.ok = false;
+      setErrorInfoBestEffort(
+          settled.error,
+          "HostError",
+          "Unknown host async callback failure");
+      completeOnce(std::move(settled));
+    }
     });
   } catch (...) {
     finishWorkerCallbackDispatch(registry);

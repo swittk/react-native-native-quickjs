@@ -1,13 +1,30 @@
 pluginManagement {
   def configured = System.getenv("REACT_NATIVE_NODE_MODULES_DIR")
-  def nodeModules = configured != null
-      ? new File(configured).canonicalFile
-      : new File(settingsDir, "../node_modules").canonicalFile
-  def reactPlugin = new File(nodeModules, "@react-native/gradle-plugin")
-  if (!reactPlugin.isDirectory()) {
+  File nodeModules = null
+  File reactPlugin = null
+
+  if (configured != null) {
+    nodeModules = new File(configured).canonicalFile
+    reactPlugin = new File(nodeModules, "@react-native/gradle-plugin")
+  } else {
+    def current = settingsDir.canonicalFile
+    while (current != null) {
+      def candidateNodeModules = new File(current, "node_modules")
+      def candidatePlugin =
+          new File(candidateNodeModules, "@react-native/gradle-plugin")
+      if (candidatePlugin.isDirectory()) {
+        nodeModules = candidateNodeModules.canonicalFile
+        reactPlugin = candidatePlugin.canonicalFile
+        break
+      }
+      current = current.parentFile
+    }
+  }
+
+  if (reactPlugin == null || !reactPlugin.isDirectory()) {
     throw new GradleException(
-        "react-native-native-quickjs: @react-native/gradle-plugin was not found under " +
-        nodeModules)
+        "react-native-native-quickjs: unable to locate @react-native/gradle-plugin " +
+        "(set REACT_NATIVE_NODE_MODULES_DIR to override discovery)")
   }
   includeBuild(reactPlugin)
   repositories {

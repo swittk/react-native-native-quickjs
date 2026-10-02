@@ -390,6 +390,15 @@ std::string requiredString(
   return arguments[index].asString(runtime).utf8(runtime);
 }
 
+void validateFilename(
+    jsi::Runtime& runtime,
+    const std::string& filename) {
+  if (filename.find('\0') != std::string::npos) {
+    throw jsi::JSError(
+        runtime, "QuickJS filename cannot contain embedded NUL characters");
+  }
+}
+
 std::string requiredModuleName(
     jsi::Runtime& runtime,
     const jsi::Value* arguments,
@@ -814,6 +823,7 @@ class WorkerHostObject final : public jsi::HostObject,
               throw jsi::JSError(rt, "Evaluate filename must be a string");
             }
             filename = filenameValue.asString(rt).utf8(rt);
+            validateFilename(rt, filename);
           }
           const auto modeValue = options.getProperty(rt, "mode");
           if (!modeValue.isUndefined()) {
@@ -868,6 +878,7 @@ class WorkerHostObject final : public jsi::HostObject,
               throw jsi::JSError(rt, "Retain filename must be a string");
             }
             filename = filenameValue.asString(rt).utf8(rt);
+            validateFilename(rt, filename);
           }
         }
 
@@ -1841,6 +1852,7 @@ jsi::Value ContextHostObject::get(
             throw jsi::JSError(rt, "Evaluate filename must be a string");
           }
           filename = filenameValue.asString(rt).utf8(rt);
+          validateFilename(rt, filename);
         }
         mode = evalMode(rt, options);
       }
@@ -1878,6 +1890,7 @@ jsi::Value ContextHostObject::get(
             throw jsi::JSError(rt, "Retain filename must be a string");
           }
           filename = filenameValue.asString(rt).utf8(rt);
+          validateFilename(rt, filename);
         }
       }
       auto& quickjs = self->requireContext(rt);

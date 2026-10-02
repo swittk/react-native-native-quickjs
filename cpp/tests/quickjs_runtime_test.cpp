@@ -99,6 +99,48 @@ int main() {
   }
 
   {
+    QuickJSRuntime runtime;
+    runtime.addModule("child", "export default 7;");
+    auto context = runtime.createContext();
+
+    std::string nulFilename = "root";
+    nulFilename.push_back('\0');
+    nulFilename += "dir/entry.mjs";
+
+    auto moduleFilename = context->evaluate(
+        "import value from './child'; globalThis.badBase = value;",
+        nulFilename,
+        EvalMode::Module);
+    check(
+        !moduleFilename.ok() &&
+            moduleFilename.reason == "runtime" &&
+            moduleFilename.error.message.find("embedded NUL") !=
+                std::string::npos,
+        "module evaluation rejects embedded-NUL base filenames");
+
+    auto awaitedFilename = context->evaluateAwaited(
+        "await 0; 1",
+        nulFilename,
+        EvalMode::AsyncScript);
+    check(
+        !awaitedFilename.ok() &&
+            awaitedFilename.reason == "runtime" &&
+            awaitedFilename.error.message.find("embedded NUL") !=
+                std::string::npos,
+        "awaited evaluation rejects embedded-NUL filenames");
+
+    bool retainFilenameRejected = false;
+    try {
+      (void)context->retainEvaluation("() => 1", nulFilename);
+    } catch (const std::invalid_argument&) {
+      retainFilenameRejected = true;
+    }
+    check(
+        retainFilenameRejected,
+        "retained evaluation rejects embedded-NUL filenames");
+  }
+
+  {
     RuntimeOptions options;
     options.collectResultMemoryStats = true;
     QuickJSRuntime runtime(options);

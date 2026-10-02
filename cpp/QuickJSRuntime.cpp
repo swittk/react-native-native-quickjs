@@ -212,6 +212,10 @@ std::string boundedOwnDataStringProperty(
   return result;
 }
 
+bool hasEmbeddedNul(const std::string& value) noexcept {
+  return value.find('\0') != std::string::npos;
+}
+
 std::size_t nonNegative(int64_t value) noexcept {
   return value <= 0 ? 0 : static_cast<std::size_t>(value);
 }
@@ -282,7 +286,7 @@ void QuickJSRuntime::addModule(std::string name, std::string source) {
   if (name.empty()) {
     throw std::invalid_argument("Module name cannot be empty");
   }
-  if (name.find('\0') != std::string::npos) {
+  if (hasEmbeddedNul(name)) {
     throw std::invalid_argument(
         "Module name cannot contain embedded NUL characters");
   }
@@ -729,6 +733,17 @@ ExecutionResult QuickJSContext::evaluate(
   }
   ContextPin pin(*this);
 
+  if (hasEmbeddedNul(filename)) {
+    ExecutionResult result;
+    result.reason = "runtime";
+    result.code = 1;
+    result.error.name = "TypeError";
+    result.error.message =
+        "QuickJS filename cannot contain embedded NUL characters";
+    result.memory = runtime_.resultMemoryStats();
+    result.outputTruncated = outputWasTruncated();
+    return result;
+  }
 
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
@@ -769,6 +784,17 @@ ExecutionResult QuickJSContext::evaluateAwaited(
   }
   ContextPin pin(*this);
 
+  if (hasEmbeddedNul(filename)) {
+    ExecutionResult result;
+    result.reason = "runtime";
+    result.code = 1;
+    result.error.name = "TypeError";
+    result.error.message =
+        "QuickJS filename cannot contain embedded NUL characters";
+    result.memory = runtime_.resultMemoryStats();
+    result.outputTruncated = outputWasTruncated();
+    return result;
+  }
 
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
@@ -965,6 +991,10 @@ std::uint64_t QuickJSContext::retainEvaluation(
     const std::string& filename) {
   if (!isOpen()) {
     throw std::runtime_error("QuickJS context is disposed");
+  }
+  if (hasEmbeddedNul(filename)) {
+    throw std::invalid_argument(
+        "QuickJS filename cannot contain embedded NUL characters");
   }
   ContextPin pin(*this);
 

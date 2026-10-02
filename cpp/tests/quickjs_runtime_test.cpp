@@ -1130,6 +1130,32 @@ int main() {
 
   {
     RuntimeOptions options;
+    options.executionLimitMs = 15;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+    context->registerHostFunction(
+        "consumeHostArg",
+        [](const std::vector<Value>&) -> Value {
+          return Value{true};
+        });
+
+    auto result = context->evaluate(
+        "let caught = false;"
+        "try {"
+        "  consumeHostArg({ get x() { for (;;) {} } });"
+        "  caught = true;"
+        "} catch (error) {"
+        "  caught = true;"
+        "}"
+        "caught;",
+        "host-argument-deadline.js");
+    check(
+        !result.ok() && result.reason == "deadline",
+        "host argument conversion preserves an uncatchable deadline interrupt");
+  }
+
+  {
+    RuntimeOptions options;
     options.executionLimitMs = 20;
     QuickJSRuntime runtime(options);
     auto context = runtime.createContext();
@@ -1600,6 +1626,60 @@ int main() {
     check(
         pendingAfterCancel.load(std::memory_order_acquire) == 0,
         "cancelled host Promise releases pending resolver handles");
+  }
+
+  {
+    std::atomic<QuickJSRuntime*> active{nullptr};
+    std::mutex readyMutex;
+    std::condition_variable readyCondition;
+    bool ready = false;
+    rnquickjs::ExecutionResult result;
+
+    std::thread worker([&] {
+      QuickJSRuntime runtime;
+      auto context = runtime.createContext();
+      context->registerAsyncHostFunction(
+          "consumeAsyncHostArg",
+          [](const std::vector<Value>& args,
+             QuickJSContext::AsyncHostCompletion complete) {
+            QuickJSContext::AsyncHostResult completion;
+            completion.value = args.empty() ? Value{true} : args.front();
+            complete(std::move(completion));
+          });
+      active.store(&runtime, std::memory_order_release);
+      {
+        std::lock_guard<std::mutex> lock(readyMutex);
+        ready = true;
+      }
+      readyCondition.notify_one();
+
+      result = context->evaluateAwaited(
+          "let caught = false;"
+          "try {"
+          "  await consumeAsyncHostArg({ get x() { for (;;) {} } });"
+          "  caught = true;"
+          "} catch (error) {"
+          "  caught = true;"
+          "}"
+          "caught;",
+          "async-host-argument-cancel.js",
+          EvalMode::AsyncScript);
+      active.store(nullptr, std::memory_order_release);
+    });
+
+    {
+      std::unique_lock<std::mutex> lock(readyMutex);
+      readyCondition.wait(lock, [&] { return ready; });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (auto* runtime = active.load(std::memory_order_acquire)) {
+      runtime->requestCancellation();
+    }
+    worker.join();
+
+    check(
+        !result.ok() && result.reason == "cancelled",
+        "async host argument conversion preserves an uncatchable cancellation interrupt");
   }
 
   {

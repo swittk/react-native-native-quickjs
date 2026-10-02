@@ -1767,10 +1767,19 @@ JSValue QuickJSContext::hostFunctionThunk(
       args.push_back(self->fromJSValue(argv[index], 0, &nodes));
     }
   } catch (const std::bad_alloc&) {
+    if (JS_HasException(context)) {
+      return JS_EXCEPTION;
+    }
     return JS_ThrowOutOfMemory(context);
   } catch (const std::exception& error) {
+    if (JS_HasException(context)) {
+      return JS_EXCEPTION;
+    }
     return JS_ThrowTypeError(context, "%s", error.what());
   } catch (...) {
+    if (JS_HasException(context)) {
+      return JS_EXCEPTION;
+    }
     return JS_ThrowInternalError(
         context, "Unknown host argument conversion failure");
   }
@@ -1820,10 +1829,19 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
       args.push_back(self->fromJSValue(argv[index], 0, &nodes));
     }
   } catch (const std::bad_alloc&) {
+    if (JS_HasException(context)) {
+      return JS_EXCEPTION;
+    }
     return JS_ThrowOutOfMemory(context);
   } catch (const std::exception& error) {
+    if (JS_HasException(context)) {
+      return JS_EXCEPTION;
+    }
     return JS_ThrowTypeError(context, "%s", error.what());
   } catch (...) {
+    if (JS_HasException(context)) {
+      return JS_EXCEPTION;
+    }
     return JS_ThrowInternalError(
         context, "Unknown async host argument conversion failure");
   }

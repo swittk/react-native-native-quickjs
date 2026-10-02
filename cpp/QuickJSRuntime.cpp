@@ -1132,6 +1132,7 @@ ExecutionResult QuickJSContext::call(
         JS_FreeValue(context_, value);
       }
     }
+    discardException(context_);
     throw;
   }
 
@@ -1220,6 +1221,7 @@ ExecutionResult QuickJSContext::callAwaited(
         JS_FreeValue(context_, value);
       }
     }
+    discardException(context_);
     throw;
   }
 

@@ -428,9 +428,52 @@ int main() {
         result.value.has_value() &&
             number(object(*result.value).at("doubled")) == 42,
         "retained callback returns bridged object");
+    Value tooDeep{1};
+    for (int depth = 0; depth < 40; ++depth) {
+      tooDeep = Value{Value::Array{std::move(tooDeep)}};
+    }
+
+    bool callThrew = false;
+    try {
+      (void)context->call(handle, {tooDeep});
+    } catch (const std::exception&) {
+      callThrew = true;
+    }
+    check(
+        callThrew && !JS_HasException(context->rawContext()),
+        "retained call conversion failure clears the pending QuickJS exception");
+
+    auto afterCallFailure = context->evaluate("21 * 2", "after-call-conversion-failure.js");
+    check(
+        afterCallFailure.ok() && afterCallFailure.value.has_value() &&
+            number(*afterCallFailure.value) == 42 &&
+            !JS_HasException(context->rawContext()),
+        "context stays clean after retained call conversion failure");
+
+    bool callAwaitedThrew = false;
+    try {
+      (void)context->callAwaited(handle, {tooDeep});
+    } catch (const std::exception&) {
+      callAwaitedThrew = true;
+    }
+    check(
+        callAwaitedThrew && !JS_HasException(context->rawContext()),
+        "retained awaited-call conversion failure clears the pending QuickJS exception");
+
+    auto afterAwaitedCallFailure =
+        context->evaluate("6 * 7", "after-awaited-call-conversion-failure.js");
+    check(
+        afterAwaitedCallFailure.ok() &&
+            afterAwaitedCallFailure.value.has_value() &&
+            number(*afterAwaitedCallFailure.value) == 42 &&
+            !JS_HasException(context->rawContext()),
+        "context stays clean after retained awaited-call conversion failure");
+
     context->release(handle);
     auto released = context->call(handle);
-    check(!released.ok() && released.reason == "invalid-handle", "released handle is invalid");
+    check(
+        !released.ok() && released.reason == "invalid-handle",
+        "released handle is invalid");
   }
 
   {

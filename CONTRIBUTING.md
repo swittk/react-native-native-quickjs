@@ -14,7 +14,7 @@ pnpm install
 
 The repository uses PNPM workspaces so the root React Native 0.83 development toolchain and the React Native 0.73 example can keep independent dependency graphs.
 
-While developing, you can run the [example app](/example/) to test your changes. Any changes you make in your library's JavaScript code will be reflected in the example app without a rebuild. If you change any native code, then you'll need to rebuild the example app.
+While developing, you can run the [example app](example/) to test your changes. Any changes you make in your library's JavaScript code will be reflected in the example app without a rebuild. If you change any native code, then you'll need to rebuild the example app.
 
 To start the packager:
 

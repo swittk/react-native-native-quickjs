@@ -306,12 +306,8 @@ void QuickJSRuntime::clearModules() {
 
 void QuickJSRuntime::requestCancellation() noexcept {
   cancellationRequested_.store(true, std::memory_order_relaxed);
-  std::vector<std::shared_ptr<QuickJSContext>> contexts;
-  {
-    std::lock_guard<std::mutex> lock(contextsMutex_);
-    contexts = contexts_;
-  }
-  for (const auto& context : contexts) {
+  std::lock_guard<std::mutex> lock(contextsMutex_);
+  for (const auto& context : contexts_) {
     if (context) {
       context->notifyAsyncActivity();
     }
@@ -384,14 +380,23 @@ void QuickJSRuntime::dispose() noexcept {
     return;
   }
 
-  std::vector<std::shared_ptr<QuickJSContext>> contexts;
   {
     std::lock_guard<std::mutex> lock(contextsMutex_);
-    contexts = contexts_;
+    for (const auto& context : contexts_) {
+      if (context) {
+        context->disposeRequested_ = true;
+      }
+    }
   }
-  for (const auto& context : contexts) {
-    if (context) {
-      context->dispose();
+  flushDeferredContextDisposals();
+
+  // A pinned child context still owns JSValues from this runtime. Never free
+  // the JSRuntime underneath it; the caller may retry disposal after the pin
+  // is released.
+  {
+    std::lock_guard<std::mutex> lock(contextsMutex_);
+    if (!contexts_.empty()) {
+      return;
     }
   }
 
@@ -603,14 +608,29 @@ void QuickJSRuntime::forgetContext(QuickJSContext* context) noexcept {
 }
 
 void QuickJSRuntime::flushDeferredContextDisposals() noexcept {
-  std::vector<std::shared_ptr<QuickJSContext>> contexts;
-  {
-    std::lock_guard<std::mutex> lock(contextsMutex_);
-    contexts = contexts_;
-  }
-  for (const auto& context : contexts) {
-    if (context && context->disposeRequested_) {
-      context->dispose();
+  for (;;) {
+    std::shared_ptr<QuickJSContext> context;
+    {
+      std::lock_guard<std::mutex> lock(contextsMutex_);
+      const auto found = std::find_if(
+          contexts_.begin(),
+          contexts_.end(),
+          [](const std::shared_ptr<QuickJSContext>& item) {
+            return item &&
+                item->disposeRequested_ &&
+                item->canDispose();
+          });
+      if (found == contexts_.end()) {
+        return;
+      }
+      context = *found;
+    }
+
+    context->dispose();
+    if (context->isOpen()) {
+      // A concurrent pin appeared after selection. Leave the request pending;
+      // the next releasePin()/flush will retry without spinning here.
+      return;
     }
   }
 }

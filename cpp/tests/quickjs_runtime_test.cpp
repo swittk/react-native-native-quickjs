@@ -1832,6 +1832,20 @@ int main() {
     check(!context->isOpen(), "runtime disposal closes child contexts safely");
   }
 
+  {
+    QuickJSRuntime runtime;
+    auto first = runtime.createContext();
+    auto second = runtime.createContext();
+    check(
+        first->evaluate("1", "first-dispose.js").ok() &&
+            second->evaluate("2", "second-dispose.js").ok(),
+        "multiple contexts work before runtime disposal");
+    runtime.dispose();
+    check(
+        !first->isOpen() && !second->isOpen() && !runtime.isOpen(),
+        "runtime disposal closes all child contexts before freeing runtime");
+  }
+
   if (failures != 0) {
     std::cerr << failures << " native QuickJS test(s) failed\n";
     return EXIT_FAILURE;

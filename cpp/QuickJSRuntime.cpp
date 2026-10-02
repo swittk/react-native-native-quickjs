@@ -1,6 +1,7 @@
 #include "QuickJSRuntime.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -1100,21 +1101,43 @@ ExecutionResult QuickJSContext::call(
   }
 
   AsyncRequestScope requestScope(*this);
-  std::vector<JSValue> jsArgs;
-  jsArgs.reserve(args.size());
+  constexpr std::size_t kInlineArgumentCapacity = 4;
+  std::array<JSValue, kInlineArgumentCapacity> inlineArgs;
+  std::vector<JSValue> heapArgs;
+  const bool useInlineArgs = args.size() <= kInlineArgumentCapacity;
+  if (!useInlineArgs) {
+    heapArgs.reserve(args.size());
+  }
+  std::size_t convertedArgs = 0;
   try {
     for (const auto& arg : args) {
-      jsArgs.push_back(toJSValue(arg));
-      if (JS_IsException(jsArgs.back())) {
+      JSValue converted = toJSValue(arg);
+      if (JS_IsException(converted)) {
         throw std::runtime_error("Unable to convert host argument");
       }
+      if (useInlineArgs) {
+        inlineArgs[convertedArgs] = converted;
+      } else {
+        heapArgs.push_back(converted);
+      }
+      ++convertedArgs;
     }
   } catch (...) {
-    for (auto value : jsArgs) {
-      JS_FreeValue(context_, value);
+    if (useInlineArgs) {
+      for (std::size_t index = 0; index < convertedArgs; ++index) {
+        JS_FreeValue(context_, inlineArgs[index]);
+      }
+    } else {
+      for (auto value : heapArgs) {
+        JS_FreeValue(context_, value);
+      }
     }
     throw;
   }
+
+  JSValue* jsArgData = useInlineArgs
+      ? inlineArgs.data()
+      : heapArgs.data();
 
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
@@ -1123,11 +1146,17 @@ ExecutionResult QuickJSContext::call(
       context_,
       function,
       JS_UNDEFINED,
-      static_cast<int>(jsArgs.size()),
-      jsArgs.data());
+      static_cast<int>(args.size()),
+      jsArgData);
   JS_FreeValue(context_, function);
-  for (auto value : jsArgs) {
-    JS_FreeValue(context_, value);
+  if (useInlineArgs) {
+    for (std::size_t index = 0; index < convertedArgs; ++index) {
+      JS_FreeValue(context_, inlineArgs[index]);
+    }
+  } else {
+    for (auto value : heapArgs) {
+      JS_FreeValue(context_, value);
+    }
   }
 
   ExecutionResult result = JS_IsException(resultValue)
@@ -1160,21 +1189,43 @@ ExecutionResult QuickJSContext::callAwaited(
   }
 
   AsyncRequestScope requestScope(*this);
-  std::vector<JSValue> jsArgs;
-  jsArgs.reserve(args.size());
+  constexpr std::size_t kInlineArgumentCapacity = 4;
+  std::array<JSValue, kInlineArgumentCapacity> inlineArgs;
+  std::vector<JSValue> heapArgs;
+  const bool useInlineArgs = args.size() <= kInlineArgumentCapacity;
+  if (!useInlineArgs) {
+    heapArgs.reserve(args.size());
+  }
+  std::size_t convertedArgs = 0;
   try {
     for (const auto& arg : args) {
-      jsArgs.push_back(toJSValue(arg));
-      if (JS_IsException(jsArgs.back())) {
+      JSValue converted = toJSValue(arg);
+      if (JS_IsException(converted)) {
         throw std::runtime_error("Unable to convert host argument");
       }
+      if (useInlineArgs) {
+        inlineArgs[convertedArgs] = converted;
+      } else {
+        heapArgs.push_back(converted);
+      }
+      ++convertedArgs;
     }
   } catch (...) {
-    for (auto value : jsArgs) {
-      JS_FreeValue(context_, value);
+    if (useInlineArgs) {
+      for (std::size_t index = 0; index < convertedArgs; ++index) {
+        JS_FreeValue(context_, inlineArgs[index]);
+      }
+    } else {
+      for (auto value : heapArgs) {
+        JS_FreeValue(context_, value);
+      }
     }
     throw;
   }
+
+  JSValue* jsArgData = useInlineArgs
+      ? inlineArgs.data()
+      : heapArgs.data();
 
   const auto started = std::chrono::steady_clock::now();
   beginExecution();
@@ -1183,11 +1234,17 @@ ExecutionResult QuickJSContext::callAwaited(
       context_,
       function,
       JS_UNDEFINED,
-      static_cast<int>(jsArgs.size()),
-      jsArgs.data());
+      static_cast<int>(args.size()),
+      jsArgData);
   JS_FreeValue(context_, function);
-  for (auto value : jsArgs) {
-    JS_FreeValue(context_, value);
+  if (useInlineArgs) {
+    for (std::size_t index = 0; index < convertedArgs; ++index) {
+      JS_FreeValue(context_, inlineArgs[index]);
+    }
+  } else {
+    for (auto value : heapArgs) {
+      JS_FreeValue(context_, value);
+    }
   }
 
   if (JS_IsException(resultValue)) {

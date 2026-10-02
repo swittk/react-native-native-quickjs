@@ -436,6 +436,32 @@ int main() {
   {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
+    const auto syncHandle = context->retainEvaluation(
+        "(a, b, c, d, e) => a + b + c + d + e",
+        "five-arg-sync.js");
+    auto syncResult = context->call(
+        syncHandle,
+        {Value{1}, Value{2}, Value{3}, Value{4}, Value{5}});
+    check(
+        syncResult.ok() && syncResult.value.has_value() &&
+            number(*syncResult.value) == 15,
+        "retained sync callback supports heap fallback beyond inline arguments");
+
+    const auto asyncHandle = context->retainEvaluation(
+        "async (a, b, c, d, e) => a + b + c + d + e",
+        "five-arg-async.js");
+    auto asyncResult = context->callAwaited(
+        asyncHandle,
+        {Value{1}, Value{2}, Value{3}, Value{4}, Value{5}});
+    check(
+        asyncResult.ok() && asyncResult.value.has_value() &&
+            number(*asyncResult.value) == 15,
+        "retained awaited callback supports heap fallback beyond inline arguments");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
     std::uint64_t handle = 0;
     context->registerHostFunction(
         "releaseCurrentHandle",

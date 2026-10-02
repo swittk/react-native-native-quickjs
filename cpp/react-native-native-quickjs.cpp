@@ -964,6 +964,10 @@ class WorkerHostObject final : public jsi::HostObject,
           }
           const auto array = args[1].asObject(rt).asArray(rt);
           const auto size = array.size(rt);
+          if (size > kMaxBridgeNodes) {
+            throw jsi::JSError(
+                rt, "QuickJS call arguments exceed bridge conversion limits");
+          }
           values.reserve(size);
           std::size_t nodes = 0;
           JSIBridgeHelpers helpers;
@@ -1963,6 +1967,10 @@ jsi::Value ContextHostObject::get(
         }
         const auto array = args[1].asObject(rt).asArray(rt);
         const auto size = array.size(rt);
+        if (size > kMaxBridgeNodes) {
+          throw jsi::JSError(
+              rt, "QuickJS call arguments exceed bridge conversion limits");
+        }
         values.reserve(size);
         std::size_t nodes = 0;
         JSIBridgeHelpers helpers;

@@ -279,6 +279,23 @@ export interface QuickJSRuntime {
 }
 
 function wrapContext(native: NativeQuickJSContext): QuickJSContext {
+  // ContextHostObject materializes methods through its JSI property trap.
+  // Cache those stable method functions once so hot calls do not allocate a
+  // fresh host-function wrapper on every property access.
+  let evaluateNative: NativeQuickJSContext['evaluate'] | undefined;
+  let retainNative: NativeQuickJSContext['retain'] | undefined;
+  let callNative: NativeQuickJSContext['call'] | undefined;
+  let releaseNative: NativeQuickJSContext['release'] | undefined;
+  let executePendingJobsNative:
+    | NativeQuickJSContext['executePendingJobs']
+    | undefined;
+  let getOutputNative: NativeQuickJSContext['getOutput'] | undefined;
+  let takeOutputNative: NativeQuickJSContext['takeOutput'] | undefined;
+  let registerHostFunctionNative:
+    | NativeQuickJSContext['registerHostFunction']
+    | undefined;
+  let disposeNative: NativeQuickJSContext['dispose'] | undefined;
+
   return {
     get valid() {
       return native.valid;
@@ -293,13 +310,13 @@ function wrapContext(native: NativeQuickJSContext): QuickJSContext {
       source: string,
       options?: QuickJSEvaluateOptions
     ): QuickJSExecutionResult<T> {
-      return native.evaluate(source, options) as QuickJSExecutionResult<T>;
+      return (evaluateNative ??= native.evaluate)(source, options) as QuickJSExecutionResult<T>;
     },
     evalModule<T extends QuickJSValue = QuickJSValue>(
       source: string,
       options: Omit<QuickJSEvaluateOptions, 'mode'> = {}
     ): QuickJSExecutionResult<T> {
-      return native.evaluate(source, {
+      return (evaluateNative ??= native.evaluate)(source, {
         ...options,
         mode: 'module',
       }) as QuickJSExecutionResult<T>;
@@ -308,26 +325,27 @@ function wrapContext(native: NativeQuickJSContext): QuickJSContext {
       source: string,
       options: Omit<QuickJSEvaluateOptions, 'mode'> = {}
     ): QuickJSExecutionResult<T> {
-      return native.evaluate(source, {
+      return (evaluateNative ??= native.evaluate)(source, {
         ...options,
         mode: 'async-script',
       }) as QuickJSExecutionResult<T>;
     },
     retain: (sourceOrGlobal, options) =>
-      native.retain(sourceOrGlobal, options),
+      (retainNative ??= native.retain)(sourceOrGlobal, options),
     call<T extends QuickJSValue = QuickJSValue>(
       handle: number,
       args?: QuickJSValue[]
     ): QuickJSExecutionResult<T> {
-      return native.call(handle, args) as QuickJSExecutionResult<T>;
+      return (callNative ??= native.call)(handle, args) as QuickJSExecutionResult<T>;
     },
-    release: handle => native.release(handle),
-    executePendingJobs: maxJobs => native.executePendingJobs(maxJobs),
-    getOutput: count => native.getOutput(count),
-    takeOutput: count => native.takeOutput(count),
+    release: handle => (releaseNative ??= native.release)(handle),
+    executePendingJobs: maxJobs =>
+      (executePendingJobsNative ??= native.executePendingJobs)(maxJobs),
+    getOutput: count => (getOutputNative ??= native.getOutput)(count),
+    takeOutput: count => (takeOutputNative ??= native.takeOutput)(count),
     registerHostFunction: (name, callback) =>
-      native.registerHostFunction(name, callback),
-    dispose: () => native.dispose(),
+      (registerHostFunctionNative ??= native.registerHostFunction)(name, callback),
+    dispose: () => (disposeNative ??= native.dispose)(),
   };
 }
 
@@ -339,6 +357,10 @@ interface PendingWorkerTask {
 }
 
 function createWorkerTaskAwaiter(worker: NativeQuickJSWorker) {
+  // WorkerHostObject creates method functions from its JSI property trap.
+  // Retain this hot polling method once instead of allocating a fresh host
+  // function on every poll.
+  const takeNextTaskResult = worker.takeNextTaskResult;
   const pending = new Map<number, PendingWorkerTask>();
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -357,7 +379,7 @@ function createWorkerTaskAwaiter(worker: NativeQuickJSWorker) {
     pollTimer = undefined;
     try {
       while (true) {
-        const result = worker.takeNextTaskResult();
+        const result = takeNextTaskResult();
         if (!result) {
           break;
         }
@@ -459,6 +481,21 @@ export function createQuickJSWorker(
   }
 
   const native = globalThis.SKRNNativeQuickJSCreateWorker(options);
+  // JSI HostObject methods are materialized by property access. Cache worker
+  // methods once so each task does not allocate a fresh host function wrapper.
+  let startEvaluate: NativeQuickJSWorker['startEvaluate'] | undefined;
+  let startRetain: NativeQuickJSWorker['startRetain'] | undefined;
+  let startCall: NativeQuickJSWorker['startCall'] | undefined;
+  let startMemory: NativeQuickJSWorker['startMemory'] | undefined;
+  let release: NativeQuickJSWorker['release'] | undefined;
+  let registerNativeAsyncHostFunction:
+    | NativeQuickJSWorker['registerAsyncHostFunction']
+    | undefined;
+  let addModule: NativeQuickJSWorker['addModule'] | undefined;
+  let removeModule: NativeQuickJSWorker['removeModule'] | undefined;
+  let clearModules: NativeQuickJSWorker['clearModules'] | undefined;
+  let cancel: NativeQuickJSWorker['cancel'] | undefined;
+  let disposeNative: NativeQuickJSWorker['dispose'] | undefined;
   const taskAwaiter = createWorkerTaskAwaiter(native);
   return {
     get valid() {
@@ -472,7 +509,7 @@ export function createQuickJSWorker(
       options: QuickJSEvaluateOptions = {}
     ): Promise<QuickJSWorkerResult<T>> {
       return taskAwaiter.wait<T>(
-        native.startEvaluate(source, {
+        (startEvaluate ??= native.startEvaluate)(source, {
           ...options,
           mode: options.mode ?? 'async-script',
         })
@@ -483,7 +520,7 @@ export function createQuickJSWorker(
       retainOptions?: QuickJSRetainOptions
     ): Promise<number> {
       const result = await taskAwaiter.wait(
-        native.startRetain(sourceOrGlobal, retainOptions)
+        (startRetain ??= native.startRetain)(sourceOrGlobal, retainOptions)
       );
       if (result.reason !== 'ok') {
         throwWorkerResult(result);
@@ -497,31 +534,31 @@ export function createQuickJSWorker(
       handle: number,
       args?: QuickJSValue[]
     ): Promise<QuickJSWorkerResult<T>> {
-      return taskAwaiter.wait<T>(native.startCall(handle, args));
+      return taskAwaiter.wait<T>((startCall ??= native.startCall)(handle, args));
     },
     async memoryAsync(): Promise<QuickJSMemoryStats> {
-      const result = await taskAwaiter.wait(native.startMemory());
+      const result = await taskAwaiter.wait((startMemory ??= native.startMemory)());
       if (result.reason !== 'ok') {
         throwWorkerResult(result);
       }
       return result.memory;
     },
-    release: handle => native.release(handle),
+    release: handle => (release ??= native.release)(handle),
     async registerAsyncHostFunction(name, callback): Promise<void> {
       const result = await taskAwaiter.wait(
-        native.registerAsyncHostFunction(name, callback)
+        (registerNativeAsyncHostFunction ??= native.registerAsyncHostFunction)(name, callback)
       );
       if (result.reason !== 'ok') {
         throwWorkerResult(result);
       }
     },
-    addModule: (name, source) => native.addModule(name, source),
-    removeModule: name => native.removeModule(name),
-    clearModules: () => native.clearModules(),
-    cancel: () => native.cancel(),
+    addModule: (name, source) => (addModule ??= native.addModule)(name, source),
+    removeModule: name => (removeModule ??= native.removeModule)(name),
+    clearModules: () => (clearModules ??= native.clearModules)(),
+    cancel: () => (cancel ??= native.cancel)(),
     dispose: () => {
       try {
-        native.dispose();
+        (disposeNative ??= native.dispose)();
       } finally {
         taskAwaiter.dispose();
       }

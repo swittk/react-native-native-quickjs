@@ -506,13 +506,10 @@ export function createQuickJSWorker(
     },
     async evaluateAsync<T extends QuickJSValue = QuickJSValue>(
       source: string,
-      options: QuickJSEvaluateOptions = {}
+      options?: QuickJSEvaluateOptions
     ): Promise<QuickJSWorkerResult<T>> {
       return taskAwaiter.wait<T>(
-        (startEvaluate ??= native.startEvaluate)(source, {
-          ...options,
-          mode: options.mode ?? 'async-script',
-        })
+        (startEvaluate ??= native.startEvaluate)(source, options)
       );
     },
     async retainAsync(

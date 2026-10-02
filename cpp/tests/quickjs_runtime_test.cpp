@@ -268,6 +268,56 @@ int main() {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
 
+    bool syncCalled = false;
+    context->registerHostFunction(
+        "manySyncArgs",
+        [&syncCalled](const std::vector<Value>& args) -> Value {
+          syncCalled = true;
+          return Value{static_cast<int>(args.size())};
+        });
+    auto syncTooMany = context->evaluate(
+        "try {"
+        "  manySyncArgs(...Array(17000).fill(1));"
+        "  'not-rejected';"
+        "} catch (error) { error.name; }",
+        "many-sync-host-args.js");
+    check(
+        syncTooMany.ok() &&
+            syncTooMany.value.has_value() &&
+            std::get<std::string>(syncTooMany.value->data) == "RangeError" &&
+            !syncCalled,
+        "oversized sync host argument list is rejected before native dispatch");
+
+    bool asyncCalled = false;
+    context->registerAsyncHostFunction(
+        "manyAsyncArgs",
+        [&asyncCalled](
+            const std::vector<Value>& args,
+            QuickJSContext::AsyncHostCompletion complete) {
+          asyncCalled = true;
+          QuickJSContext::AsyncHostResult result;
+          result.value = Value{static_cast<int>(args.size())};
+          complete(std::move(result));
+        });
+    auto asyncTooMany = context->evaluateAwaited(
+        "try {"
+        "  await manyAsyncArgs(...Array(17000).fill(1));"
+        "  'not-rejected';"
+        "} catch (error) { error.name; }",
+        "many-async-host-args.js",
+        EvalMode::AsyncScript);
+    check(
+        asyncTooMany.ok() &&
+            asyncTooMany.value.has_value() &&
+            std::get<std::string>(asyncTooMany.value->data) == "RangeError" &&
+            !asyncCalled,
+        "oversized async host argument list is rejected before native dispatch");
+  }
+
+  {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+
     const std::string syncName{"nul\0host", 8};
     context->registerHostFunction(
         syncName,

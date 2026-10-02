@@ -1818,9 +1818,15 @@ JSValue QuickJSContext::hostFunctionThunk(
     return JS_ThrowReferenceError(context, "Unknown host function");
   }
 
+  if (argc < 0 ||
+      static_cast<std::size_t>(argc) > kMaxValueNodes) {
+    return JS_ThrowRangeError(
+        context, "Host function argument count exceeds conversion limits");
+  }
+
   std::vector<Value> args;
   try {
-    args.reserve(static_cast<std::size_t>(std::max(argc, 0)));
+    args.reserve(static_cast<std::size_t>(argc));
     std::size_t nodes = 0;
     for (int index = 0; index < argc; ++index) {
       args.push_back(self->fromJSValue(argv[index], 0, &nodes));
@@ -1880,9 +1886,15 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
     return JS_ThrowReferenceError(context, "Unknown async host function");
   }
 
+  if (argc < 0 ||
+      static_cast<std::size_t>(argc) > kMaxValueNodes) {
+    return JS_ThrowRangeError(
+        context, "Host function argument count exceeds conversion limits");
+  }
+
   std::vector<Value> args;
   try {
-    args.reserve(static_cast<std::size_t>(std::max(argc, 0)));
+    args.reserve(static_cast<std::size_t>(argc));
     std::size_t nodes = 0;
     for (int index = 0; index < argc; ++index) {
       args.push_back(self->fromJSValue(argv[index], 0, &nodes));

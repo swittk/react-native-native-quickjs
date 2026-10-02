@@ -2604,6 +2604,11 @@ Value QuickJSContext::fromJSValue(
             JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
       throw std::runtime_error("Unable to enumerate QuickJS object");
     }
+    if (count > kMaxValueNodes) {
+      JS_FreePropertyEnum(context_, properties, count);
+      throw std::runtime_error(
+          "QuickJS object exceeds host conversion limits");
+    }
 
     Value::Object object;
     try {

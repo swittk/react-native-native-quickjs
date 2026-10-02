@@ -96,6 +96,24 @@ int main() {
         bridged.value.has_value() &&
             std::get<std::string>(object(*bridged.value).at("hello").data) == "world",
         "object bridge preserves properties");
+
+    auto oversizedObject = context->evaluate(
+        "Object.fromEntries("
+        "  Array.from({length: 17000}, (_, i) => ['k' + i, i])"
+        ")",
+        "oversized-object-bridge.js");
+    check(
+        !oversizedObject.ok() &&
+            oversizedObject.reason == "value-conversion",
+        "oversized plain object is rejected before native map construction");
+
+    auto afterOversizedObject =
+        context->evaluate("6 * 7", "after-oversized-object.js");
+    check(
+        afterOversizedObject.ok() &&
+            afterOversizedObject.value.has_value() &&
+            number(*afterOversizedObject.value) == 42,
+        "context stays reusable after oversized object conversion rejection");
   }
 
   {

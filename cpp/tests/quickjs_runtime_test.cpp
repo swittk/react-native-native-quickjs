@@ -1069,6 +1069,51 @@ int main() {
             number(*nestedValue.value) == 91,
         "nested request survives outer call cleanup and settles later");
 
+    QuickJSContext::AsyncHostCompletion completePumpScopedRequest;
+    context->registerAsyncHostFunction(
+        "pumpScopedRequest",
+        [&completePumpScopedRequest](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          completePumpScopedRequest = std::move(complete);
+        });
+    auto pumpScopedSetup = context->evaluate(
+        "globalThis.pumpScopedValue = 0;"
+        "Promise.resolve().then(() => {"
+        "  pumpScopedRequest().then(v => { globalThis.pumpScopedValue = v; });"
+        "  Promise.reject(new Error('pump-rejection'));"
+        "});"
+        "void 0;",
+        "pump-scoped-request-setup.js");
+    check(
+        pumpScopedSetup.ok(),
+        "pump-scoped async request regression setup succeeds");
+
+    auto rejectingPump = context->executePendingJobs(
+        std::numeric_limits<std::size_t>::max(), false);
+    check(
+        !rejectingPump.ok() &&
+            rejectingPump.reason == "promise-rejection" &&
+            rejectingPump.error.message == "pump-rejection" &&
+            static_cast<bool>(completePumpScopedRequest) &&
+            context->pendingAsyncCount() == 1,
+        "ordinary pump failure preserves async request created by guest job");
+
+    QuickJSContext::AsyncHostResult pumpScopedCompletion;
+    pumpScopedCompletion.value = Value{123};
+    completePumpScopedRequest(std::move(pumpScopedCompletion));
+    auto pumpScopedResume = context->executePendingJobs(
+        std::numeric_limits<std::size_t>::max(), false);
+    auto pumpScopedValue = context->evaluate(
+        "globalThis.pumpScopedValue",
+        "pump-scoped-request-check.js");
+    check(
+        pumpScopedResume.ok() &&
+            pumpScopedValue.ok() &&
+            pumpScopedValue.value.has_value() &&
+            number(*pumpScopedValue.value) == 123,
+        "pump-scoped request still settles after unrelated rejection");
+
     QuickJSContext::AsyncHostCompletion completeBadBatch;
     QuickJSContext::AsyncHostCompletion completeGoodBatch;
     context->registerAsyncHostFunction(

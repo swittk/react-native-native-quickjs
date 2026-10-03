@@ -1383,8 +1383,6 @@ ExecutionResult QuickJSContext::executePendingJobs(
     if (failure->reason == "cancelled" ||
         runtime_.cancellationRequested()) {
       clearPendingAsyncPromises();
-    } else {
-      clearPendingAsyncPromisesForScope(requestScope.id());
     }
     failure->durationMs = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started)
@@ -1398,13 +1396,10 @@ ExecutionResult QuickJSContext::executePendingJobs(
   ExecutionResult result = drainPendingJobsInCurrentTurn(
       started, maxJobs, collectSuccessMemory);
   endExecution();
-  if (!result.ok()) {
-    if (result.reason == "cancelled" ||
-        runtime_.cancellationRequested()) {
-      clearPendingAsyncPromises();
-    } else {
-      clearPendingAsyncPromisesForScope(requestScope.id());
-    }
+  if (!result.ok() &&
+      (result.reason == "cancelled" ||
+       runtime_.cancellationRequested())) {
+    clearPendingAsyncPromises();
   }
   return result;
 }

@@ -1114,6 +1114,52 @@ int main() {
             number(*pumpScopedValue.value) == 123,
         "pump-scoped request still settles after unrelated rejection");
 
+    QuickJSContext::AsyncHostCompletion completeNestedPumpRequest;
+    context->registerAsyncHostFunction(
+        "nestedPumpRequest",
+        [&completeNestedPumpRequest](
+            const std::vector<Value>&,
+            QuickJSContext::AsyncHostCompletion complete) {
+          completeNestedPumpRequest = std::move(complete);
+        });
+    context->registerAsyncHostFunction(
+        "nestedPumpOuterNever",
+        [](const std::vector<Value>&, QuickJSContext::AsyncHostCompletion) {});
+    context->registerHostFunction(
+        "runNestedPump",
+        [&context](const std::vector<Value>&) -> Value {
+          auto setup = context->evaluate(
+              "Promise.resolve().then(() => { nestedPumpRequest(); });"
+              "void 0;",
+              "nested-pump-job-setup.js",
+              EvalMode::Script);
+          if (!setup.ok()) {
+            throw std::runtime_error("nested pump job setup failed");
+          }
+          auto pump = context->executePendingJobs(
+              std::numeric_limits<std::size_t>::max(), false);
+          if (!pump.ok()) {
+            throw std::runtime_error("nested pump failed");
+          }
+          return Value{true};
+        });
+    auto nestedPumpOuter = context->evaluate(
+        "runNestedPump(); await nestedPumpOuterNever(); 1",
+        "nested-pump-outer-pending.js",
+        EvalMode::AsyncScript);
+    check(
+        !nestedPumpOuter.ok() &&
+            nestedPumpOuter.reason == "pending-promise" &&
+            static_cast<bool>(completeNestedPumpRequest) &&
+            context->pendingAsyncCount() == 0,
+        "nested pump requests inherit outer scope and are cleared when outer await is abandoned");
+    QuickJSContext::AsyncHostResult staleNestedPumpCompletion;
+    staleNestedPumpCompletion.value = Value{321};
+    completeNestedPumpRequest(std::move(staleNestedPumpCompletion));
+    check(
+        context->queuedAsyncCompletionCount() == 0,
+        "late completion from abandoned nested-pump request is dropped");
+
     QuickJSContext::AsyncHostCompletion completeBadBatch;
     QuickJSContext::AsyncHostCompletion completeGoodBatch;
     context->registerAsyncHostFunction(

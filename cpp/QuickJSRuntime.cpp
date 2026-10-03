@@ -1376,8 +1376,10 @@ ExecutionResult QuickJSContext::executePendingJobs(
     return result;
   }
   ContextPin pin(*this);
-  AsyncRequestScope requestScope(*this);
 
+  // A pump does not own async requests. Requests created by jobs inherit the
+  // surrounding operation's scope when nested, or remain unscoped when this is
+  // a standalone pump.
   processAsyncCompletions();
   if (auto failure = takeAsyncCompletionFailure()) {
     if (failure->reason == "cancelled" ||

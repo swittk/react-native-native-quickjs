@@ -1,0 +1,35 @@
+{
+  "name": "react-native-native-quickjs-example",
+  "description": "Example app for react-native-native-quickjs",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "android": "react-native run-android",
+    "ios": "react-native run-ios",
+    "start": "react-native start"
+  },
+  "dependencies": {
+    "react": "18.2.0",
+    "react-native": "0.73.6",
+    "react-native-native-quickjs": "workspace:*"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.20.0",
+    "@babel/preset-env": "^7.20.0",
+    "@babel/runtime": "^7.20.0",
+    "@react-native/babel-preset": "0.73.21",
+    "@react-native/metro-config": "0.73.5",
+    "@react-native/typescript-config": "0.73.1",
+    "@types/jest": "^29.5.12",
+    "@types/react": "^18.2.6",
+    "typescript": "5.0.4",
+    "@react-native-community/cli": "12.3.6",
+    "@react-native-community/cli-platform-android": "12.3.6",
+    "@react-native-community/cli-platform-ios": "12.3.6",
+    "@react-native/gradle-plugin": "0.73.4",
+    "@react-native/codegen": "0.73.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

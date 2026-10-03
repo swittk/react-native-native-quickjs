@@ -1,0 +1,7 @@
+packages:
+  - example
+
+packageExtensions:
+  react-native@0.73.6:
+    dependencies:
+      '@types/react': 18.3.31

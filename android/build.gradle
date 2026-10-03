@@ -1,0 +1,180 @@
+import groovy.json.JsonSlurper
+import java.nio.file.Paths
+
+buildscript {
+  if (project == rootProject) {
+    repositories {
+      google()
+      mavenCentral()
+    }
+    dependencies {
+      classpath "com.android.tools.build:gradle:8.9.1"
+      classpath "com.facebook.react:react-native-gradle-plugin"
+    }
+  }
+}
+
+apply plugin: "com.android.library"
+
+static def findNodeModules(File projectDirectory, File rootDirectory) {
+  def configured = System.getenv("REACT_NATIVE_NODE_MODULES_DIR")
+  if (configured != null && new File(configured, "react-native/package.json").exists()) {
+    return new File(configured).canonicalPath
+  }
+  // Prefer the consuming app. Local file: installs can otherwise discover a
+  // development-only RN version nested inside the copied package checkout.
+  def starts = [rootDirectory.toPath().normalize(), projectDirectory.toPath().normalize()]
+  for (def start : starts) {
+    def current = start
+    while (current != null) {
+      def candidate = Paths.get(current.toString(), "node_modules")
+      if (candidate.resolve("react-native/package.json").toFile().exists()) {
+        return candidate.toString()
+      }
+      current = current.getParent()
+    }
+  }
+  throw new GradleException("react-native-native-quickjs: unable to locate react-native in node_modules")
+}
+
+def nodeModules = findNodeModules(projectDir, rootProject.projectDir)
+def reactNativeVersionsFile = file("${nodeModules}/react-native/gradle/libs.versions.toml")
+def reactNativeVersionValue = { String name, Object fallback ->
+  if (reactNativeVersionsFile.exists()) {
+    def matcher = reactNativeVersionsFile.text =~ /(?m)^${name}\s*=\s*"([^"]+)"/
+    if (matcher.find()) {
+      return matcher.group(1)
+    }
+  }
+  return fallback.toString()
+}
+def reactNativePackage = new JsonSlurper().parse(file("${nodeModules}/react-native/package.json"))
+def reactNativeVersionMatch = reactNativePackage.version =~ /^(\d+)\.(\d+)\.(\d+)/
+if (!reactNativeVersionMatch.find()) {
+  throw new GradleException(
+      "react-native-native-quickjs: unable to parse React Native version ${reactNativePackage.version}")
+}
+def reactNativeMajorVersion = reactNativeVersionMatch.group(1).toInteger()
+def reactNativeMinorVersion = reactNativeVersionMatch.group(2).toInteger()
+def reactNativePatchVersion = reactNativeVersionMatch.group(3).toInteger()
+def rnAtLeastMinor = { int minor ->
+  reactNativeMajorVersion > 0 || reactNativeMinorVersion >= minor
+}
+if (reactNativeMajorVersion == 0 &&
+    (reactNativeMinorVersion < 73 ||
+        (reactNativeMinorVersion == 73 && reactNativePatchVersion < 6))) {
+  throw new GradleException("react-native-native-quickjs requires React Native 0.73.6 or newer")
+}
+def rnMinSdkVersion = reactNativeVersionValue(
+    "minSdk", rnAtLeastMinor(80) ? 24 : 21).toInteger()
+def rnTargetSdkVersion = reactNativeVersionValue(
+    "targetSdk", rnAtLeastMinor(80) ? 35 : 34).toInteger()
+def rnCompileSdkVersion = reactNativeVersionValue(
+    "compileSdk", rnAtLeastMinor(80) ? 35 : 34).toInteger()
+def rnNdkVersion = reactNativeVersionValue(
+    "ndkVersion", rnAtLeastMinor(80) ? "27.1.12297006" : "25.1.8937393")
+def rnFbjniVersion = reactNativeVersionValue(
+    "fbjni", rnAtLeastMinor(76) ? "0.7.0" : "0.5.1")
+
+def newArchitectureEnabled =
+    project.hasProperty("newArchEnabled") && project.property("newArchEnabled") == "true"
+def reactNativeArchitectures = project.findProperty("reactNativeArchitectures")
+
+apply plugin: "com.facebook.react"
+react {
+  libraryName = "NativeQuickJS"
+  jsRootDir = file("..")
+  reactNativeDir = file("${nodeModules}/react-native")
+  codegenDir = file("${nodeModules}/@react-native/codegen")
+  codegenJavaPackageName = "com.reactnativenativequickjs"
+}
+
+def safeExtGet(String name, Object fallback) {
+  return rootProject.ext.has(name) ? rootProject.ext.get(name) : fallback
+}
+
+android {
+  namespace "com.reactnativenativequickjs"
+
+  compileSdkVersion safeExtGet(
+      "QuickJS_compileSdkVersion", safeExtGet("compileSdkVersion", rnCompileSdkVersion))
+  ndkVersion safeExtGet(
+      "QuickJS_ndkVersion", safeExtGet("ndkVersion", rnNdkVersion))
+
+  defaultConfig {
+    minSdkVersion safeExtGet(
+        "QuickJS_minSdkVersion", safeExtGet("minSdkVersion", rnMinSdkVersion))
+    targetSdkVersion safeExtGet(
+        "QuickJS_targetSdkVersion", safeExtGet("targetSdkVersion", rnTargetSdkVersion))
+    buildConfigField "boolean", "IS_NEW_ARCHITECTURE_ENABLED", newArchitectureEnabled.toString()
+
+    externalNativeBuild {
+      cmake {
+        cppFlags "-O2 -frtti -fexceptions -Wall -fstack-protector-all"
+        arguments "-DNODE_MODULES_DIR=${nodeModules}",
+            "-DRNQJS_RN_AT_LEAST_0_76=${rnAtLeastMinor(76)}",
+            "-DRNQJS_RN_AT_LEAST_0_80=${rnAtLeastMinor(80)}",
+            "-DRNQJS_NEW_ARCH_ENABLED=${newArchitectureEnabled}",
+            "-DANDROID_STL=c++_shared"
+        if (reactNativeArchitectures != null) {
+          abiFilters(*reactNativeArchitectures.split(","))
+        } else {
+          abiFilters "x86", "x86_64", "armeabi-v7a", "arm64-v8a"
+        }
+      }
+    }
+  }
+
+  sourceSets {
+    main {
+      java.srcDir(newArchitectureEnabled ? "src/newarch/java" : "src/oldarch/java")
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+    }
+  }
+
+  buildFeatures {
+    buildConfig = true
+    prefab = true
+  }
+
+  // These are link-time Prefab dependencies supplied by the consuming RN app;
+  // only libSKRNNativeQuickJS.so belongs in this library's AAR.
+  packagingOptions {
+    exclude "**/libc++_shared.so"
+    exclude "**/libfbjni.so"
+    exclude "**/libjsi.so"
+    exclude "**/libreactnative.so"
+    exclude "**/libreactnativejni.so"
+  }
+
+  buildTypes {
+    release {
+      minifyEnabled false
+    }
+  }
+
+  lintOptions {
+    disable "GradleCompatible"
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+}
+
+repositories {
+  mavenLocal()
+  google()
+  mavenCentral()
+}
+
+dependencies {
+  implementation "com.facebook.react:react-android"
+  implementation "com.facebook.fbjni:fbjni:${safeExtGet('fbjniVersion', rnFbjniVersion)}"
+}

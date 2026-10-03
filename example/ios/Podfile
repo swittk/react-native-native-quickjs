@@ -1,0 +1,30 @@
+# Resolve react_native_pods.rb with Node so hoisted installs also work.
+require Pod::Executable.execute_command('node', ['-p',
+  'require.resolve(
+    "react-native/scripts/react_native_pods.rb",
+    {paths: [process.argv[1]]},
+  )', __dir__]).strip
+
+# This example intentionally exercises RN 0.73.6's legacy bridge/JSI path.
+ENV['RCT_NEW_ARCH_ENABLED'] ||= '0'
+
+platform :ios, min_ios_version_supported
+prepare_react_native_project!
+
+target 'QuickJSExample' do
+  config = use_native_modules!
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    :flipper_configuration => FlipperConfiguration.disabled,
+    :app_path => "#{Pod::Config.instance.installation_root}/.."
+  )
+
+  post_install do |installer|
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false
+    )
+  end
+end

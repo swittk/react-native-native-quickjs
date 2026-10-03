@@ -1851,8 +1851,10 @@ JSValue QuickJSContext::hostFunctionThunk(
   try {
     args.reserve(static_cast<std::size_t>(argc));
     std::size_t nodes = 0;
+    std::size_t bytes = 0;
     for (int index = 0; index < argc; ++index) {
-      args.push_back(self->fromJSValue(argv[index], 0, &nodes));
+      args.push_back(self->fromJSValue(
+          argv[index], 0, &nodes, &bytes));
     }
   } catch (const std::bad_alloc&) {
     if (JS_HasException(context)) {
@@ -1919,8 +1921,10 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
   try {
     args.reserve(static_cast<std::size_t>(argc));
     std::size_t nodes = 0;
+    std::size_t bytes = 0;
     for (int index = 0; index < argc; ++index) {
-      args.push_back(self->fromJSValue(argv[index], 0, &nodes));
+      args.push_back(self->fromJSValue(
+          argv[index], 0, &nodes, &bytes));
     }
   } catch (const std::bad_alloc&) {
     if (JS_HasException(context)) {
@@ -2523,10 +2527,15 @@ ErrorInfo QuickJSContext::takeExceptionInfo() {
 Value QuickJSContext::fromJSValue(
     JSValue value,
     int depth,
-    std::size_t* nodeCount) {
+    std::size_t* nodeCount,
+    std::size_t* byteCount) {
   std::size_t localNodes = 0;
+  std::size_t localBytes = 0;
   if (nodeCount == nullptr) {
     nodeCount = &localNodes;
+  }
+  if (byteCount == nullptr) {
+    byteCount = &localBytes;
   }
   if (depth > kMaxValueDepth || ++(*nodeCount) > kMaxValueNodes) {
     throw std::runtime_error("QuickJS value exceeds host conversion limits");
@@ -2559,6 +2568,12 @@ Value QuickJSContext::fromJSValue(
       throw std::runtime_error("Unable to convert QuickJS string");
     }
     ScopedQuickJSCString ownedText{context_, text};
+    const std::size_t byteLimit = runtime_.options().memoryLimitBytes;
+    if (*byteCount > byteLimit || length > byteLimit - *byteCount) {
+      throw std::runtime_error(
+          "QuickJS string data exceeds host conversion byte limit");
+    }
+    *byteCount += length;
     return Value{std::string(text, length)};
   }
 
@@ -2584,7 +2599,7 @@ Value QuickJSContext::fromJSValue(
         throw std::runtime_error("Unable to read QuickJS array item");
       }
       try {
-        array.push_back(fromJSValue(item, depth + 1, nodeCount));
+        array.push_back(fromJSValue(item, depth + 1, nodeCount, byteCount));
       } catch (...) {
         JS_FreeValue(context_, item);
         throw;
@@ -2644,6 +2659,13 @@ Value QuickJSContext::fromJSValue(
           throw std::runtime_error("Unable to convert QuickJS object key");
         }
         ScopedQuickJSCString ownedKeyText{context_, keyText};
+        const std::size_t byteLimit = runtime_.options().memoryLimitBytes;
+        if (*byteCount > byteLimit ||
+            keyLength > byteLimit - *byteCount) {
+          throw std::runtime_error(
+              "QuickJS object keys exceed host conversion byte limit");
+        }
+        *byteCount += keyLength;
         std::string key(keyText, keyLength);
 
         JSValue item =
@@ -2654,7 +2676,7 @@ Value QuickJSContext::fromJSValue(
         try {
           object.emplace(
               std::move(key),
-              fromJSValue(item, depth + 1, nodeCount));
+              fromJSValue(item, depth + 1, nodeCount, byteCount));
         } catch (...) {
           JS_FreeValue(context_, item);
           throw;

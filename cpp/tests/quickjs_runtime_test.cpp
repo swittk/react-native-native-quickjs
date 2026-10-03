@@ -333,6 +333,44 @@ int main() {
   }
 
   {
+    RuntimeOptions options;
+    options.memoryLimitBytes = 2 * 1024 * 1024;
+    QuickJSRuntime runtime(options);
+    auto context = runtime.createContext();
+
+    auto repeatedStringResult = context->evaluate(
+        "const shared = 'x'.repeat(65536);"
+        "Array(64).fill(shared);",
+        "shared-string-result-amplification.js");
+    check(
+        !repeatedStringResult.ok() &&
+            repeatedStringResult.reason == "value-conversion",
+        "guest result conversion bounds aggregate copied string bytes");
+
+    bool amplifiedArgsCalled = false;
+    context->registerHostFunction(
+        "amplifiedStringArgs",
+        [&amplifiedArgsCalled](const std::vector<Value>& args) -> Value {
+          amplifiedArgsCalled = true;
+          return Value{static_cast<int>(args.size())};
+        });
+    auto repeatedStringArgs = context->evaluate(
+        "const sharedArg = 'y'.repeat(65536);"
+        "try {"
+        "  amplifiedStringArgs(...Array(64).fill(sharedArg));"
+        "  'not-rejected';"
+        "} catch (error) { error.name; }",
+        "shared-string-argument-amplification.js");
+    check(
+        repeatedStringArgs.ok() &&
+            repeatedStringArgs.value.has_value() &&
+            std::get<std::string>(repeatedStringArgs.value->data) ==
+                "TypeError" &&
+            !amplifiedArgsCalled,
+        "guest host-function arguments bound aggregate copied string bytes");
+  }
+
+  {
     QuickJSRuntime runtime;
     auto context = runtime.createContext();
 

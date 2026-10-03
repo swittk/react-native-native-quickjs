@@ -251,7 +251,11 @@ class QuickJSContext final {
       std::size_t maxJobs = 1'000,
       bool collectSuccessMemory = true);
 
-  Value fromJSValue(JSValue value, int depth = 0, std::size_t* nodeCount = nullptr);
+  Value fromJSValue(
+      JSValue value,
+      int depth = 0,
+      std::size_t* nodeCount = nullptr,
+      std::size_t* byteCount = nullptr);
   JSValue toJSValue(const Value& value, int depth = 0, std::size_t* nodeCount = nullptr);
 
   class AsyncRequestScope final {

@@ -282,7 +282,8 @@ std::shared_ptr<QuickJSContext> QuickJSRuntime::createContext() {
   if (!isOpen()) {
     throw std::runtime_error("QuickJS runtime is disposed");
   }
-  auto context = std::make_shared<QuickJSContext>(*this);
+  auto context = std::make_shared<QuickJSContext>(
+      QuickJSContext::ConstructionKey{}, *this);
   {
     std::lock_guard<std::mutex> lock(contextsMutex_);
     contexts_.push_back(context);
@@ -662,7 +663,9 @@ void QuickJSRuntime::flushDeferredContextDisposals() noexcept {
   }
 }
 
-QuickJSContext::QuickJSContext(QuickJSRuntime& runtime)
+QuickJSContext::QuickJSContext(
+    ConstructionKey,
+    QuickJSRuntime& runtime)
     : runtime_(runtime), asyncState_(std::make_shared<AsyncState>()) {
   if (!runtime_.isOpen()) {
     throw std::runtime_error("QuickJS runtime is disposed");

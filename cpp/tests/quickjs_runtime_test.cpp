@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -20,6 +21,10 @@ using rnquickjs::QuickJSExecutionException;
 using rnquickjs::QuickJSContext;
 using rnquickjs::RuntimeOptions;
 using rnquickjs::Value;
+
+static_assert(
+    !std::is_constructible_v<QuickJSContext, QuickJSRuntime&>,
+    "QuickJSContext must only be created through QuickJSRuntime::createContext");
 
 namespace {
 int failures = 0;

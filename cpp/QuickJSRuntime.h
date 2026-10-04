@@ -124,6 +124,12 @@ struct ExecutionResult {
 class QuickJSRuntime;
 
 class QuickJSContext final {
+ private:
+  struct ConstructionKey {
+    explicit ConstructionKey() = default;
+  };
+  friend class QuickJSRuntime;
+
  public:
   using HostFunction = std::function<Value(const std::vector<Value>&)>;
 
@@ -137,7 +143,7 @@ class QuickJSContext final {
       const std::vector<Value>&,
       AsyncHostCompletion)>;
 
-  explicit QuickJSContext(QuickJSRuntime& runtime);
+  QuickJSContext(ConstructionKey, QuickJSRuntime& runtime);
   ~QuickJSContext();
 
   QuickJSContext(const QuickJSContext&) = delete;

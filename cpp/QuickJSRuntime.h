@@ -199,6 +199,7 @@ class QuickJSContext final {
   void dispose() noexcept;
   bool isOpen() const noexcept;
   bool isExecuting() const noexcept;
+  std::size_t memoryLimitBytes() const noexcept;
   bool canDispose() const noexcept;
 
   JSContext* rawContext() noexcept { return context_; }

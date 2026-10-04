@@ -44,6 +44,17 @@ void countNode(int depth, std::size_t& nodes) {
   }
 }
 
+void countBridgeBytes(
+    std::size_t amount,
+    std::size_t& bytes,
+    std::size_t byteLimit) {
+  if (bytes > byteLimit || amount > byteLimit - bytes) {
+    throw std::runtime_error(
+        "String data exceeds QuickJS bridge conversion byte limit");
+  }
+  bytes += amount;
+}
+
 struct JSIBridgeHelpers {
   std::optional<jsi::Function> getPrototypeOf;
   std::optional<jsi::Object> objectPrototype;
@@ -92,6 +103,8 @@ rnquickjs::Value fromJSI(
     const jsi::Value& value,
     int depth,
     std::size_t& nodes,
+    std::size_t& bytes,
+    std::size_t byteLimit,
     JSIBridgeHelpers& helpers) {
   countNode(depth, nodes);
   if (value.isUndefined()) {
@@ -107,7 +120,9 @@ rnquickjs::Value fromJSI(
     return rnquickjs::Value{value.asNumber()};
   }
   if (value.isString()) {
-    return rnquickjs::Value{value.asString(runtime).utf8(runtime)};
+    auto string = value.asString(runtime).utf8(runtime);
+    countBridgeBytes(string.size(), bytes, byteLimit);
+    return rnquickjs::Value{std::move(string)};
   }
   if (!value.isObject()) {
     throw std::runtime_error(
@@ -126,7 +141,14 @@ rnquickjs::Value fromJSI(
     for (std::size_t index = 0; index < size; ++index) {
       const auto item = array.getValueAtIndex(runtime, index);
       result.push_back(
-          fromJSI(runtime, item, depth + 1, nodes, helpers));
+          fromJSI(
+              runtime,
+              item,
+              depth + 1,
+              nodes,
+              bytes,
+              byteLimit,
+              helpers));
     }
     return rnquickjs::Value{std::move(result)};
   }
@@ -147,19 +169,32 @@ rnquickjs::Value fromJSI(
   for (std::size_t index = 0; index < size; ++index) {
     const auto keyValue = keys.getValueAtIndex(runtime, index);
     const auto keyString = keyValue.asString(runtime);
-    const auto key = keyString.utf8(runtime);
+    auto key = keyString.utf8(runtime);
+    countBridgeBytes(key.size(), bytes, byteLimit);
     const auto item = object.getProperty(runtime, keyString);
     result.emplace(
-        key,
-        fromJSI(runtime, item, depth + 1, nodes, helpers));
+        std::move(key),
+        fromJSI(
+            runtime,
+            item,
+            depth + 1,
+            nodes,
+            bytes,
+            byteLimit,
+            helpers));
   }
   return rnquickjs::Value{std::move(result)};
 }
 
-rnquickjs::Value fromJSI(jsi::Runtime& runtime, const jsi::Value& value) {
+rnquickjs::Value fromJSI(
+    jsi::Runtime& runtime,
+    const jsi::Value& value,
+    std::size_t byteLimit) {
   std::size_t nodes = 0;
+  std::size_t bytes = 0;
   JSIBridgeHelpers helpers;
-  return fromJSI(runtime, value, 0, nodes, helpers);
+  return fromJSI(
+      runtime, value, 0, nodes, bytes, byteLimit, helpers);
 }
 
 void defineOwnDataProperty(
@@ -472,7 +507,8 @@ jsi::Function makeFunction(
 rnquickjs::Value invokeJSCallback(
     jsi::Runtime& runtime,
     const jsi::Function& callback,
-    const std::vector<rnquickjs::Value>& arguments) {
+    const std::vector<rnquickjs::Value>& arguments,
+    std::size_t byteLimit) {
   std::vector<jsi::Value> values;
   values.reserve(arguments.size());
   for (const auto& argument : arguments) {
@@ -480,7 +516,7 @@ rnquickjs::Value invokeJSCallback(
   }
   const jsi::Value* data = values.data();
   const auto result = callback.call(runtime, data, values.size());
-  return fromJSI(runtime, result);
+  return fromJSI(runtime, result, byteLimit);
 }
 
 rnquickjs::Value invokeOnJSThread(
@@ -488,9 +524,10 @@ rnquickjs::Value invokeOnJSThread(
     const std::shared_ptr<CallInvoker>& callInvoker,
     const std::thread::id& jsThread,
     const std::shared_ptr<jsi::Function>& callback,
-    const std::vector<rnquickjs::Value>& arguments) {
+    const std::vector<rnquickjs::Value>& arguments,
+    std::size_t byteLimit) {
   if (std::this_thread::get_id() == jsThread) {
-    return invokeJSCallback(runtime, *callback, arguments);
+    return invokeJSCallback(runtime, *callback, arguments, byteLimit);
   }
   if (!callInvoker) {
     throw std::runtime_error("React Native CallInvoker is unavailable");
@@ -505,9 +542,10 @@ rnquickjs::Value invokeOnJSThread(
   };
   auto invocation = std::make_shared<Invocation>();
   callInvoker->invokeAsync([
-      &runtime, callback, arguments, invocation]() {
+      &runtime, callback, arguments, invocation, byteLimit]() {
     try {
-      invocation->result = invokeJSCallback(runtime, *callback, arguments);
+      invocation->result =
+          invokeJSCallback(runtime, *callback, arguments, byteLimit);
     } catch (...) {
       invocation->error = std::current_exception();
     }
@@ -622,6 +660,7 @@ void invokeAsyncOnJSThread(
     WorkerCallbackRegistry* registry,
     jsi::Function* callback,
     const std::vector<rnquickjs::Value>& arguments,
+    std::size_t byteLimit,
     rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
   if (!callInvoker || registry == nullptr || callback == nullptr) {
     rnquickjs::QuickJSContext::AsyncHostResult result;
@@ -648,6 +687,7 @@ void invokeAsyncOnJSThread(
         registry,
         callback,
         arguments,
+        byteLimit,
         completion = std::move(completion)]() mutable {
       struct DispatchGuard {
         WorkerCallbackRegistry* registry;
@@ -700,7 +740,7 @@ void invokeAsyncOnJSThread(
               runtime,
               "resolveQuickJSHostPromise",
               1,
-              [completeOnce](
+              [completeOnce, byteLimit](
                   jsi::Runtime& rt,
                   const jsi::Value&,
                   const jsi::Value* args,
@@ -708,7 +748,9 @@ void invokeAsyncOnJSThread(
                 rnquickjs::QuickJSContext::AsyncHostResult settled;
                 try {
                   settled.value =
-                      count == 0 ? rnquickjs::Value{} : fromJSI(rt, args[0]);
+                      count == 0
+                      ? rnquickjs::Value{}
+                      : fromJSI(rt, args[0], byteLimit);
                 } catch (const std::exception& error) {
                   settled.ok = false;
                   setErrorInfoBestEffort(
@@ -759,7 +801,7 @@ void invokeAsyncOnJSThread(
       }
 
       rnquickjs::QuickJSContext::AsyncHostResult settled;
-      settled.value = fromJSI(runtime, result);
+      settled.value = fromJSI(runtime, result, byteLimit);
       completeOnce(std::move(settled));
     } catch (const std::exception& error) {
       rnquickjs::QuickJSContext::AsyncHostResult settled;
@@ -984,6 +1026,7 @@ class WorkerHostObject final : public jsi::HostObject,
           }
           values.reserve(size);
           std::size_t nodes = 0;
+          std::size_t bytes = 0;
           JSIBridgeHelpers helpers;
           for (std::size_t index = 0; index < size; ++index) {
             values.push_back(fromJSI(
@@ -991,6 +1034,8 @@ class WorkerHostObject final : public jsi::HostObject,
                 array.getValueAtIndex(rt, index),
                 0,
                 nodes,
+                bytes,
+                self->bridgeByteLimit_,
                 helpers));
           }
         }
@@ -1124,6 +1169,7 @@ class WorkerHostObject final : public jsi::HostObject,
             args[1].asObject(rt).asFunction(rt));
         auto* hostRuntime = &self->hostRuntime_;
         const auto invoker = self->callInvoker_;
+        const auto bridgeByteLimit = self->bridgeByteLimit_;
 
         WorkerCallbackRegistry* registry = nullptr;
         jsi::Function* callbackPointer = nullptr;
@@ -1146,12 +1192,18 @@ class WorkerHostObject final : public jsi::HostObject,
               hostRuntime,
               invoker,
               registry,
-              callbackPointer](
+              callbackPointer,
+              bridgeByteLimit](
                   rnquickjs::QuickJSRuntime&,
                   rnquickjs::QuickJSContext& context) {
             context.registerAsyncHostFunction(
                 functionName,
-                [hostRuntime, invoker, registry, callbackPointer](
+                [
+                    hostRuntime,
+                    invoker,
+                    registry,
+                    callbackPointer,
+                    bridgeByteLimit](
                     const std::vector<rnquickjs::Value>& values,
                     rnquickjs::QuickJSContext::AsyncHostCompletion completion) {
                   invokeAsyncOnJSThread(
@@ -1160,6 +1212,7 @@ class WorkerHostObject final : public jsi::HostObject,
                       registry,
                       callbackPointer,
                       values,
+                      bridgeByteLimit,
                       std::move(completion));
                 });
             return rnquickjs::ExecutionResult{};
@@ -1508,6 +1561,7 @@ class WorkerHostObject final : public jsi::HostObject,
       setActiveRuntime(&quickjs);
       {
         std::lock_guard<std::mutex> lock(mutex_);
+        bridgeByteLimit_ = quickjs.memoryLimitBytes();
         ready_ = true;
       }
       condition_.notify_all();
@@ -1628,6 +1682,7 @@ class WorkerHostObject final : public jsi::HostObject,
   jsi::Runtime& hostRuntime_;
   std::shared_ptr<CallInvoker> callInvoker_;
   rnquickjs::RuntimeOptions options_;
+  std::size_t bridgeByteLimit_ = 0;
   std::thread worker_;
   std::thread::id jsThread_{std::this_thread::get_id()};
 
@@ -2032,10 +2087,19 @@ jsi::Value ContextHostObject::get(
         }
         values.reserve(size);
         std::size_t nodes = 0;
+        std::size_t bytes = 0;
         JSIBridgeHelpers helpers;
+        const auto byteLimit = self->requireContext(rt).memoryLimitBytes();
         for (std::size_t index = 0; index < size; ++index) {
           const auto value = array.getValueAtIndex(rt, index);
-          values.push_back(fromJSI(rt, value, 0, nodes, helpers));
+          values.push_back(fromJSI(
+              rt,
+              value,
+              0,
+              nodes,
+              bytes,
+              byteLimit,
+              helpers));
         }
       }
       return resultToJSI(rt, self->requireContext(rt).call(handle, values));
@@ -2110,11 +2174,18 @@ jsi::Value ContextHostObject::get(
       auto* hostRuntime = &self->hostRuntime_;
       const auto invoker = self->callInvoker_;
       const auto jsThread = self->jsThread_;
-      self->requireContext(rt).registerHostFunction(
+      auto* nativeContext = &self->requireContext(rt);
+      nativeContext->registerHostFunction(
           functionName,
-          [hostRuntime, invoker, jsThread, callback](
+          [hostRuntime, invoker, jsThread, callback, nativeContext](
               const std::vector<rnquickjs::Value>& values) {
-            return invokeOnJSThread(*hostRuntime, invoker, jsThread, callback, values);
+            return invokeOnJSThread(
+                *hostRuntime,
+                invoker,
+                jsThread,
+                callback,
+                values,
+                nativeContext->memoryLimitBytes());
           });
       return jsi::Value::undefined();
     });

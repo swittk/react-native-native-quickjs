@@ -93,6 +93,12 @@ int main() {
     check(
         runtime.memoryStats().memoryUsedBytes > 0,
         "on-demand runtime memory stats remain available");
+    const auto originalMemoryLimit = runtime.memoryLimitBytes();
+    runtime.setMemoryLimitBytes(2 * 1024 * 1024);
+    check(
+        context->memoryLimitBytes() == runtime.memoryLimitBytes(),
+        "context bridge byte limit follows runtime memory-limit updates");
+    runtime.setMemoryLimitBytes(originalMemoryLimit);
 
     auto bridged = context->evaluate(
         "({ hello: 'world', list: [1, true, null] })", "object.js");

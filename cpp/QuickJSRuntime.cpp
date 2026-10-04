@@ -1817,6 +1817,10 @@ bool QuickJSContext::isExecuting() const noexcept {
   return executionDepth_ > 0;
 }
 
+std::size_t QuickJSContext::memoryLimitBytes() const noexcept {
+  return runtime_.memoryLimitBytes();
+}
+
 bool QuickJSContext::canDispose() const noexcept {
   return pinDepth_ == 0 && !isExecuting() && !runtime_.isExecuting();
 }

@@ -658,24 +658,38 @@ void invokeAsyncOnJSThread(
         return;
       }
 
-      auto settle = std::make_shared<std::atomic<bool>>(false);
-    const auto completeOnce =
-        [settle, completion](rnquickjs::QuickJSContext::AsyncHostResult result) {
-          bool expected = false;
-          if (settle->compare_exchange_strong(expected, true)) {
-            completion(std::move(result));
-          }
-        };
-
-    try {
-      std::vector<jsi::Value> values;
-      values.reserve(arguments.size());
-      for (const auto& argument : arguments) {
-        values.push_back(toJSI(runtime, argument));
+      std::shared_ptr<std::atomic<bool>> settle;
+      try {
+        settle = std::make_shared<std::atomic<bool>>(false);
+      } catch (...) {
+        rnquickjs::QuickJSContext::AsyncHostResult settled;
+        settled.ok = false;
+        setErrorInfoBestEffort(
+            settled.error,
+            "HostError",
+            "Unable to allocate host Promise settlement state");
+        completion(std::move(settled));
+        return;
       }
-      const jsi::Value* data = values.data();
-      jsi::Value result =
-          callback->call(runtime, data, values.size());
+      const auto completeOnce =
+          [settle, completion = std::move(completion)](
+              rnquickjs::QuickJSContext::AsyncHostResult result) {
+            bool expected = false;
+            if (settle->compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel)) {
+              completion(std::move(result));
+            }
+          };
+
+      try {
+        std::vector<jsi::Value> values;
+        values.reserve(arguments.size());
+        for (const auto& argument : arguments) {
+          values.push_back(toJSI(runtime, argument));
+        }
+        const jsi::Value* data = values.data();
+        jsi::Value result =
+            callback->call(runtime, data, values.size());
 
       if (result.isObject()) {
         auto object = result.asObject(runtime);

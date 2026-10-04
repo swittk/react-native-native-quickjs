@@ -616,12 +616,20 @@ void setErrorInfoBestEffort(
 
 rnquickjs::ErrorInfo errorFromJSI(
     jsi::Runtime& runtime,
-    const jsi::Value& value) {
+    const jsi::Value& value,
+    std::size_t byteLimit) {
   rnquickjs::ErrorInfo result;
   result.name = "Error";
+  std::size_t bytes = 0;
+
+  const auto boundedString = [&](const jsi::String& string) {
+    auto text = string.utf8(runtime);
+    countBridgeBytes(text.size(), bytes, byteLimit);
+    return text;
+  };
 
   if (value.isString()) {
-    result.message = value.asString(runtime).utf8(runtime);
+    result.message = boundedString(value.asString(runtime));
     return result;
   }
 
@@ -631,13 +639,13 @@ rnquickjs::ErrorInfo errorFromJSI(
     const auto message = object.getProperty(runtime, "message");
     const auto stack = object.getProperty(runtime, "stack");
     if (name.isString()) {
-      result.name = name.asString(runtime).utf8(runtime);
+      result.name = boundedString(name.asString(runtime));
     }
     if (message.isString()) {
-      result.message = message.asString(runtime).utf8(runtime);
+      result.message = boundedString(message.asString(runtime));
     }
     if (stack.isString()) {
-      result.stack = stack.asString(runtime).utf8(runtime);
+      result.stack = boundedString(stack.asString(runtime));
     }
   }
 
@@ -645,8 +653,8 @@ rnquickjs::ErrorInfo errorFromJSI(
     try {
       const auto stringFunction =
           runtime.global().getPropertyAsFunction(runtime, "String");
-      result.message =
-          stringFunction.call(runtime, value).asString(runtime).utf8(runtime);
+      result.message = boundedString(
+          stringFunction.call(runtime, value).asString(runtime));
     } catch (...) {
       result.message = "Host Promise rejected";
     }
@@ -769,7 +777,7 @@ void invokeAsyncOnJSThread(
               runtime,
               "rejectQuickJSHostPromise",
               1,
-              [completeOnce](
+              [completeOnce, byteLimit](
                   jsi::Runtime& rt,
                   const jsi::Value&,
                   const jsi::Value* args,
@@ -781,7 +789,8 @@ void invokeAsyncOnJSThread(
                       settled.error, "Error", "Host Promise rejected");
                 } else {
                   try {
-                    settled.error = errorFromJSI(rt, args[0]);
+                    settled.error =
+                        errorFromJSI(rt, args[0], byteLimit);
                   } catch (...) {
                     setErrorInfoBestEffort(
                         settled.error, "Error", "Host Promise rejected");

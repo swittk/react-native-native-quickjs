@@ -87,6 +87,11 @@ Retained functions remain compiled inside QuickJS and can themselves await host
 Promises:
 
 ```ts
+await worker.registerAsyncHostFunction(
+  'hostTransform',
+  async value => Number(value) * 2
+);
+
 const handle = await worker.retainAsync(
   'async value => await hostTransform(value)'
 );

@@ -344,6 +344,78 @@ int main() {
   }
 
   {
+    QuickJSRuntime runtime;
+    auto context = runtime.createContext();
+
+    int syncRegistrationIndex = 0;
+    context->registerHostFunction(
+        "growSyncHostRegistry",
+        [&context, &syncRegistrationIndex](const std::vector<Value>&) -> Value {
+          for (int index = 0; index < 512; ++index) {
+            context->registerHostFunction(
+                "rehashSync" + std::to_string(syncRegistrationIndex++),
+                [](const std::vector<Value>&) -> Value {
+                  return Value{true};
+                });
+          }
+          return Value{true};
+        });
+    context->registerHostFunction(
+        "rehashSyncTarget",
+        [](const std::vector<Value>&) -> Value {
+          return Value{77};
+        });
+
+    auto syncRehash = context->evaluate(
+        "rehashSyncTarget({"
+        "  get value() { growSyncHostRegistry(); return 1; }"
+        "});",
+        "host-registry-rehash-sync.js");
+    check(
+        syncRehash.ok() &&
+            syncRehash.value.has_value() &&
+            number(*syncRehash.value) == 77,
+        "sync host callback survives registry rehash during argument conversion");
+
+    int asyncRegistrationIndex = 0;
+    context->registerHostFunction(
+        "growAsyncHostRegistry",
+        [&context, &asyncRegistrationIndex](const std::vector<Value>&) -> Value {
+          for (int index = 0; index < 512; ++index) {
+            context->registerAsyncHostFunction(
+                "rehashAsync" + std::to_string(asyncRegistrationIndex++),
+                [](const std::vector<Value>&,
+                   QuickJSContext::AsyncHostCompletion complete) {
+                  QuickJSContext::AsyncHostResult result;
+                  result.value = Value{true};
+                  complete(std::move(result));
+                });
+          }
+          return Value{true};
+        });
+    context->registerAsyncHostFunction(
+        "rehashAsyncTarget",
+        [](const std::vector<Value>&,
+           QuickJSContext::AsyncHostCompletion complete) {
+          QuickJSContext::AsyncHostResult result;
+          result.value = Value{88};
+          complete(std::move(result));
+        });
+
+    auto asyncRehash = context->evaluateAwaited(
+        "await rehashAsyncTarget({"
+        "  get value() { growAsyncHostRegistry(); return 1; }"
+        "});",
+        "host-registry-rehash-async.js",
+        EvalMode::AsyncScript);
+    check(
+        asyncRehash.ok() &&
+            asyncRehash.value.has_value() &&
+            number(*asyncRehash.value) == 88,
+        "async host callback survives registry rehash during argument conversion");
+  }
+
+  {
     RuntimeOptions options;
     options.memoryLimitBytes = 2 * 1024 * 1024;
     QuickJSRuntime runtime(options);

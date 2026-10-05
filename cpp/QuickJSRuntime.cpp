@@ -1847,6 +1847,10 @@ JSValue QuickJSContext::hostFunctionThunk(
   if (found == self->hostFunctions_.end()) {
     return JS_ThrowReferenceError(context, "Unknown host function");
   }
+  // Argument conversion can execute guest getters that register more host
+  // functions and rehash the map. Rehash invalidates iterators, not references
+  // to existing elements.
+  const HostFunction& function = found->second;
 
   if (argc < 0 ||
       static_cast<std::size_t>(argc) > kMaxValueNodes) {
@@ -1882,7 +1886,7 @@ JSValue QuickJSContext::hostFunctionThunk(
   }
 
   try {
-    const Value result = found->second(args);
+    const Value result = function(args);
     std::size_t nodes = 0;
     return self->toJSValue(result, 0, &nodes);
   } catch (const std::bad_alloc&) {
@@ -1917,6 +1921,7 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
   if (found == self->asyncHostFunctions_.end()) {
     return JS_ThrowReferenceError(context, "Unknown async host function");
   }
+  const AsyncHostFunction& function = found->second;
 
   if (argc < 0 ||
       static_cast<std::size_t>(argc) > kMaxValueNodes) {
@@ -2094,7 +2099,7 @@ JSValue QuickJSContext::asyncHostFunctionThunk(
   };
 
   try {
-    found->second(args, complete);
+    function(args, complete);
   } catch (const std::bad_alloc&) {
     if (!completionClaimed->load(std::memory_order_acquire)) {
       markCompletionQueueFailure();

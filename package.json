@@ -33,7 +33,6 @@
     "vendor/quickjs/libunicode.c",
     "vendor/quickjs/libunicode.h",
     "vendor/quickjs/libunicode-table.h",
-    "scripts",
     "codegenConfig.json",
     "react-native-native-quickjs.podspec",
     "!lib/typescript/example",
@@ -41,13 +40,14 @@
     "!android/.gradle/**",
     "!android/.cxx/**",
     "!ios/build",
-    "!scripts/build/**",
-    "!scripts/**/build/**",
-    "!scripts/.gradle/**",
-    "!scripts/**/.gradle/**",
     "!**/__tests__",
     "!**/__fixtures__",
-    "!**/__mocks__"
+    "!**/__mocks__",
+    "!cpp/tests/**",
+    "!android/gradle/**",
+    "!android/gradlew",
+    "!android/gradlew.bat",
+    "!android/settings.gradle"
   ],
   "scripts": {
     "typescript": "tsc -p tsconfig.build.json --noEmit && pnpm --dir example exec tsc --noEmit",

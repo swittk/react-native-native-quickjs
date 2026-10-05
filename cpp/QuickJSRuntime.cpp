@@ -1724,6 +1724,9 @@ std::string QuickJSContext::getOutput(std::size_t count) const {
   const std::size_t take =
       count == 0 ? output_.size() : std::min(count, output_.size());
   std::string result;
+  if (take == output_.size() && output_.size() > 1 && outputBytes_ > 0) {
+    result.reserve(outputBytes_);
+  }
   auto line = output_.begin();
   for (std::size_t index = 0; index < take; ++index, ++line) {
     if (index > 0) {
@@ -1739,6 +1742,9 @@ std::string QuickJSContext::takeOutput(std::size_t count) {
   const std::size_t take =
       count == 0 ? output_.size() : std::min(count, output_.size());
   std::string result;
+  if (take == output_.size() && output_.size() > 1 && outputBytes_ > 0) {
+    result.reserve(outputBytes_);
+  }
   for (std::size_t index = 0; index < take; ++index) {
     if (index > 0) {
       result.push_back('\n');

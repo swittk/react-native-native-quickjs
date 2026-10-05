@@ -1716,6 +1716,11 @@ class WorkerHostObject final : public jsi::HostObject,
 
 class RuntimeHostObject;
 
+struct DeferredContextCleanup {
+  std::shared_ptr<rnquickjs::QuickJSContext> context;
+  std::shared_ptr<RuntimeHostObject> owner;
+};
+
 class ContextHostObject final : public jsi::HostObject,
                                 public std::enable_shared_from_this<ContextHostObject> {
  public:
@@ -1728,35 +1733,43 @@ class ContextHostObject final : public jsi::HostObject,
         callInvoker_(std::move(callInvoker)),
         owner_(std::move(owner)),
         context_(std::move(context)),
+        deferredCleanup_(new DeferredContextCleanup{context_, owner_}),
         jsThread_(std::this_thread::get_id()) {}
 
   ~ContextHostObject() override {
     if (!context_) {
+      delete std::exchange(deferredCleanup_, nullptr);
       return;
     }
 
     // Hermes Hades may finalize HostObjects away from the JS thread. QuickJS
     // contexts in the synchronous embedding path are JS-thread-affine, and
-    // disposing also releases retained JSI host callbacks.
-    if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
-      struct DeferredContextCleanup {
-        std::shared_ptr<rnquickjs::QuickJSContext> context;
-        std::shared_ptr<RuntimeHostObject> owner;
-      };
-      auto* deferred = new DeferredContextCleanup{
-          std::move(context_), std::move(owner_)};
-      try {
-        callInvoker_->invokeAsync([deferred]() {
-          deferred->context->dispose();
-          delete deferred;
-        });
-      } catch (...) {
-        // If the JS executor is already gone, intentionally leak the payload
-        // rather than destroy QuickJS state on a Hermes GC thread.
+    // disposing also releases retained JSI host callbacks. The cleanup payload
+    // is preallocated on construction so finalization itself never allocates.
+    if (std::this_thread::get_id() != jsThread_) {
+      auto* deferred = std::exchange(deferredCleanup_, nullptr);
+      // The payload retains both objects, so dropping the HostObject's copies
+      // here cannot run their destructors on the GC thread.
+      context_.reset();
+      owner_.reset();
+      if (deferred != nullptr && callInvoker_) {
+        try {
+          callInvoker_->invokeAsync([deferred]() {
+            deferred->context->dispose();
+            delete deferred;
+          });
+          return;
+        } catch (...) {
+          // JS executor already unavailable: intentionally leak the payload.
+        }
       }
+      // No JS executor is available. Leak rather than release QuickJS state on
+      // a Hermes GC thread.
       return;
     }
+
     context_->dispose();
+    delete std::exchange(deferredCleanup_, nullptr);
   }
 
   jsi::Value get(jsi::Runtime& runtime, const jsi::PropNameID& name) override;
@@ -1786,6 +1799,7 @@ class ContextHostObject final : public jsi::HostObject,
   std::shared_ptr<CallInvoker> callInvoker_;
   std::shared_ptr<RuntimeHostObject> owner_;
   std::shared_ptr<rnquickjs::QuickJSContext> context_;
+  DeferredContextCleanup* deferredCleanup_ = nullptr;
   std::thread::id jsThread_;
 };
 
@@ -1804,19 +1818,20 @@ class RuntimeHostObject final : public jsi::HostObject,
       return;
     }
 
-    if (callInvoker_ && std::this_thread::get_id() != jsThread_) {
-      auto* deferred =
-          new std::unique_ptr<rnquickjs::QuickJSRuntime>(
-              std::move(runtime_));
-      try {
-        callInvoker_->invokeAsync([deferred]() {
-          (*deferred)->dispose();
-          delete deferred;
-        });
-      } catch (...) {
-        // If the JS executor is already gone, intentionally leak the payload
-        // rather than destroy QuickJS state on a Hermes GC thread.
+    if (std::this_thread::get_id() != jsThread_) {
+      auto* deferred = runtime_.release();
+      if (deferred != nullptr && callInvoker_) {
+        try {
+          callInvoker_->invokeAsync([deferred]() {
+            deferred->dispose();
+            delete deferred;
+          });
+          return;
+        } catch (...) {
+          // JS executor already unavailable: intentionally leak.
+        }
       }
+      // Never free QuickJS state on a Hermes GC thread.
       return;
     }
     runtime_->dispose();

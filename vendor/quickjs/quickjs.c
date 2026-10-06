@@ -29950,14 +29950,27 @@ static JSModuleDef *js_host_resolve_imported_module_atom(JSContext *ctx,
                                                          JSValueConst attributes)
 {
     const char *base_cname, *cname;
+    size_t cname_len;
     JSModuleDef *m;
 
     base_cname = JS_AtomToCString(ctx, base_module_name);
     if (!base_cname)
         return NULL;
-    cname = JS_AtomToCString(ctx, module_name1);
+    cname = JS_AtomToCStringLen(ctx, &cname_len, module_name1);
     if (!cname) {
         JS_FreeCString(ctx, base_cname);
+        return NULL;
+    }
+    /*
+     * Module loader/normalizer callbacks use NUL-terminated C strings.
+     * Reject embedded NULs before crossing that boundary so distinct module
+     * atoms cannot alias the same host module name.
+     */
+    if (memchr(cname, '\0', cname_len) != NULL) {
+        JS_ThrowReferenceError(ctx,
+                               "Module name is not available in this runtime");
+        JS_FreeCString(ctx, base_cname);
+        JS_FreeCString(ctx, cname);
         return NULL;
     }
     m = js_host_resolve_imported_module(ctx, base_cname, cname, attributes);
@@ -30923,7 +30936,8 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     JSValueConst basename_val = argv[2];
     JSValueConst specifier = argv[3];
     JSValueConst attributes = argv[4];
-    const char *basename = NULL, *filename;
+    const char *basename = NULL, *filename = NULL;
+    size_t filename_len;
     JSValue ret, err;
 
     if (!JS_IsString(basename_val)) {
@@ -30934,9 +30948,14 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     if (!basename)
         goto exception;
 
-    filename = JS_ToCString(ctx, specifier);
+    filename = JS_ToCStringLen(ctx, &filename_len, specifier);
     if (!filename)
         goto exception;
+    if (memchr(filename, '\0', filename_len) != NULL) {
+        JS_ThrowReferenceError(ctx,
+                               "Module name is not available in this runtime");
+        goto exception;
+    }
 
     JS_LoadModuleInternal(ctx, basename, filename,
                           resolving_funcs, attributes);
@@ -30949,6 +30968,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
                    1, (JSValueConst *)&err);
     JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
     JS_FreeValue(ctx, err);
+    JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, basename);
     return JS_UNDEFINED;
 }

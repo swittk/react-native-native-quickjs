@@ -1,0 +1,126 @@
+{
+  "name": "react-native-native-quickjs",
+  "version": "0.1.0",
+  "description": "Native vendored QuickJS runtime for React Native",
+  "main": "lib/commonjs/index",
+  "module": "lib/module/index",
+  "types": "lib/typescript/index.d.ts",
+  "react-native": "src/index",
+  "source": "src/index",
+  "files": [
+    "src",
+    "lib",
+    "android",
+    "ios",
+    "cpp",
+    "vendor/QUICKJS_LICENSE",
+    "vendor/QUICKJS_SHA256",
+    "vendor/README.md",
+    "vendor/quickjs/LICENSE",
+    "vendor/quickjs/VERSION",
+    "vendor/quickjs/quickjs.c",
+    "vendor/quickjs/quickjs.h",
+    "vendor/quickjs/quickjs-atom.h",
+    "vendor/quickjs/quickjs-opcode.h",
+    "vendor/quickjs/cutils.c",
+    "vendor/quickjs/cutils.h",
+    "vendor/quickjs/list.h",
+    "vendor/quickjs/dtoa.c",
+    "vendor/quickjs/dtoa.h",
+    "vendor/quickjs/libregexp.c",
+    "vendor/quickjs/libregexp.h",
+    "vendor/quickjs/libregexp-opcode.h",
+    "vendor/quickjs/libunicode.c",
+    "vendor/quickjs/libunicode.h",
+    "vendor/quickjs/libunicode-table.h",
+    "codegenConfig.json",
+    "react-native-native-quickjs.podspec",
+    "!lib/typescript/example",
+    "!android/build",
+    "!android/.gradle/**",
+    "!android/.cxx/**",
+    "!ios/build",
+    "!**/__tests__",
+    "!**/__fixtures__",
+    "!**/__mocks__",
+    "!cpp/tests/**",
+    "!android/gradle/**",
+    "!android/gradlew",
+    "!android/gradlew.bat",
+    "!android/settings.gradle"
+  ],
+  "scripts": {
+    "typescript": "tsc -p tsconfig.build.json --noEmit && pnpm --dir example exec tsc --noEmit",
+    "test:native": "bash scripts/test-native-core.sh",
+    "prepare": "bob build",
+    "example": "pnpm --dir example",
+    "pods": "pnpm exec pod-install example/ios --quiet",
+    "bootstrap": "pnpm install && pnpm pods"
+  },
+  "keywords": [
+    "react-native",
+    "quickjs",
+    "javascript",
+    "embedded",
+    "ios",
+    "android"
+  ],
+  "repository": "https://github.com/swittk/react-native-native-quickjs",
+  "author": "Switt Kongdachalert <swittssoftware@gmail.com> (https://swittssoftware.com)",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/swittk/react-native-native-quickjs/issues"
+  },
+  "homepage": "https://github.com/swittk/react-native-native-quickjs#readme",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.2",
+    "@react-native/babel-preset": "0.83.3",
+    "@types/react": "^19.1.1",
+    "pod-install": "^1.1.0",
+    "react": "19.2.0",
+    "react-native": "0.83.10",
+    "react-native-builder-bob": "^0.43.1",
+    "typescript": "^5.9.2",
+    "@babel/preset-env": "^7.25.2",
+    "@react-native/gradle-plugin": "0.83.10",
+    "@react-native/codegen": "0.83.10"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.73.6"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "codegenConfig": {
+    "name": "NativeQuickJS",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.reactnativenativequickjs"
+    },
+    "ios": {
+      "modulesProvider": {
+        "SKNativeQuickJS": "SKNativeQuickJS"
+      }
+    }
+  },
+  "react-native-builder-bob": {
+    "source": "src",
+    "output": "lib",
+    "targets": [
+      "commonjs",
+      "module",
+      [
+        "typescript",
+        {
+          "project": "tsconfig.build.json"
+        }
+      ]
+    ]
+  },
+  "packageManager": "pnpm@10.20.0"
+}
